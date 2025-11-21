@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import io
+from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, List
 from uuid import UUID
 
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -36,6 +37,23 @@ class RunTaskResponse(BaseModel):
     status: str
 
 
+class FlowSummary(BaseModel):
+    id: str
+    app_name: str
+    task_title: str
+    status: str
+    started_at: datetime
+    finished_at: datetime | None
+    run_id: str
+
+
+class StepSummary(BaseModel):
+    index: int
+    state_label: str
+    description: str
+    url: str | None
+
+
 @app.post("/agent/run", response_model=RunTaskResponse)
 async def run_agent_task(payload: RunTaskRequest):
     """
@@ -57,6 +75,45 @@ async def run_agent_task(payload: RunTaskRequest):
 def list_flows(request: Request, db: Session = Depends(get_db)) -> Any:
     flows = db.query(Flow).order_by(Flow.started_at.desc()).limit(50).all()
     return templates.TemplateResponse("flows_list.html", {"request": request, "flows": flows})
+
+
+@app.get("/api/flows", response_model=List[FlowSummary])
+def list_flows_json(db=Depends(get_db)):
+    flows = db.query(Flow).order_by(Flow.started_at.desc()).limit(50).all()
+    return [
+        FlowSummary(
+            id=str(f.id),
+            app_name=f.app_name,
+            task_title=f.task_title,
+            status=f.status,
+            started_at=f.started_at,
+            finished_at=f.finished_at,
+            run_id=f.run_id,
+        )
+        for f in flows
+    ]
+
+
+@app.get("/api/flows/{flow_id}/steps", response_model=List[StepSummary])
+def list_flow_steps(flow_id: str, db=Depends(get_db)):
+    flow = db.query(Flow).get(flow_id)
+    if not flow:
+        raise HTTPException(status_code=404, detail="Flow not found")
+    steps = (
+        db.query(Step)
+        .filter(Step.flow_id == flow_id)
+        .order_by(Step.step_index.asc())
+        .all()
+    )
+    return [
+        StepSummary(
+            index=s.step_index,
+            state_label=s.state_label,
+            description=s.description,
+            url=s.url,
+        )
+        for s in steps
+    ]
 
 
 @app.post("/api/runs")
