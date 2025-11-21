@@ -12,8 +12,6 @@ class Settings(BaseSettings):
     minio_access_key: str | None = None
     minio_secret_key: str | None = None
     minio_bucket: str = "ui-state-capture"
-    openai_api_key: str | None = None
-    openai_model: str | None = None
     llm_provider: str = "huggingface"
     hf_model_name: str = "microsoft/Phi-3-mini-4k-instruct"
     headless: bool = True
