@@ -12,10 +12,10 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from src.agent.orchestrator import run_task_query_async
-from src.models import Flow, Step, get_db
-from src.storage.base import StorageBackend
-from src.storage.minio_store import get_storage
+from ..agent.orchestrator import run_task_query_async
+from ..models import Flow, Step, get_db
+from ..storage.base import StorageBackend
+from ..storage.minio_store import get_storage
 
 BASE_DIR = Path(__file__).parent
 
@@ -26,6 +26,31 @@ templates = Jinja2Templates(directory=BASE_DIR / "templates")
 
 class RunTaskRequest(BaseModel):
     query: str
+
+
+class RunTaskResponse(BaseModel):
+    flow_id: str
+    run_id: str
+    app_name: str
+    task_title: str
+    status: str
+
+
+@app.post("/agent/run", response_model=RunTaskResponse)
+async def run_agent_task(payload: RunTaskRequest):
+    """
+    Agent A calls this route with a natural language query.
+    We run the full agent loop and return the Flow summary.
+    """
+
+    flow = await run_task_query_async(payload.query)
+    return RunTaskResponse(
+        flow_id=str(flow.id),
+        run_id=flow.run_id,
+        app_name=flow.app_name,
+        task_title=flow.task_title,
+        status=flow.status,
+    )
 
 
 @app.get("/", response_class=HTMLResponse)
