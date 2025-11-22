@@ -11,6 +11,10 @@ from .capture import CaptureManager
 from ..models import Flow
 from .state_diff import compute_dom_diff
 
+MAX_STEPS = 10
+MAX_LOW_DIFF_IN_A_ROW = 4
+LOW_DIFF_THRESHOLD = 0.02
+
 
 def _set_cancelled(flow: Flow, session: Session) -> None:
     flow.status = "cancelled"
@@ -34,7 +38,6 @@ async def run_agent_loop(
     capture_manager: CaptureManager,
     policy: Policy,
     start_url: str,
-    max_steps: int = 15,
 ) -> None:
     session = capture_manager.db_session
     async with BrowserSession() as browser:
@@ -85,7 +88,10 @@ async def run_agent_loop(
 
         previous_url = page.url
 
-        for step_index in range(1, max_steps + 1):
+        goal_reached = False
+        low_diff_streak = 0
+
+        for step_index in range(1, MAX_STEPS + 1):
             page = browser.page
             if page is None:
                 break
@@ -118,7 +124,7 @@ async def run_agent_loop(
                         step_index=step_index,
                     )
 
-                capture_manager.finish_flow(flow, status="success")
+                goal_reached = True
                 break
 
             if decision.get("capture_before"):
@@ -195,5 +201,25 @@ async def run_agent_loop(
 
             previous_url = page.url
 
+            if diff_score is None or diff_score < LOW_DIFF_THRESHOLD:
+                low_diff_streak += 1
+            else:
+                low_diff_streak = 0
+
+            if low_diff_streak >= MAX_LOW_DIFF_IN_A_ROW:
+                flow.status = "finished"
+                flow.status_reason = "low_diff_loop"
+                flow.finished_at = datetime.now(timezone.utc)
+                session.add(flow)
+                session.commit()
+                break
+
         else:
             capture_manager.finish_flow(flow, status="max_steps_reached")
+
+        if goal_reached:
+            flow.status = "finished"
+            flow.status_reason = "goal_reached"
+            flow.finished_at = datetime.now(timezone.utc)
+            session.add(flow)
+            session.commit()

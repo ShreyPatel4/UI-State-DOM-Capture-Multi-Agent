@@ -1,11 +1,28 @@
 import json
-from typing import List, Dict
+from typing import Dict, List
 
 from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
 
 from ..config import settings
 from .task_spec import TaskSpec
 from .dom_scanner import CandidateAction
+
+
+def _extract_first_json_object(text: str) -> str | None:
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    return text[start : end + 1]
+
+
+def choose_fallback_action(goal: str, candidates: list[CandidateAction]) -> CandidateAction:
+    def score(cand: CandidateAction) -> int:
+        g = set(goal.lower().split())
+        d = set(cand.description.lower().split())
+        return len(g & d)
+
+    return max(candidates, key=score)
 
 
 class Policy:
@@ -81,12 +98,13 @@ Do NOT include any extra commentary outside the JSON.
         return out
 
     def _extract_json(self, raw: str) -> Dict:
-        start = raw.find("{")
-        end = raw.rfind("}")
-        if start == -1 or end == -1:
-            raise ValueError("No JSON object found in model output")
-        json_str = raw[start : end + 1]
-        return json.loads(json_str)
+        json_str = _extract_first_json_object(raw.strip())
+        if not json_str:
+            raise ValueError("no_json_object")
+        try:
+            return json.loads(json_str)
+        except json.JSONDecodeError:
+            raise ValueError("bad_json")
 
     async def choose_action(
         self,
@@ -102,16 +120,15 @@ Do NOT include any extra commentary outside the JSON.
 
         try:
             data = self._extract_json(raw)
-        except Exception:
-            # Fallback to first candidate if parsing fails
-            first = candidates[0]
+        except ValueError:
+            fallback = choose_fallback_action(task.goal, candidates)
             return {
-                "chosen_action_id": first.id,
-                "action_type": first.action_type,
+                "chosen_action_id": fallback.id,
+                "action_type": fallback.action_type,
                 "input_text": None,
                 "capture_before": True,
                 "capture_after": True,
-                "state_label_after": f"after_{first.id}",
+                "state_label_after": f"after_{fallback.id}",
                 "done": False,
                 "reason": "Fallback decision because model output was not valid JSON",
             }

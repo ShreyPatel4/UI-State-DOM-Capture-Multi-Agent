@@ -64,7 +64,6 @@ async def run_task_query_async(raw_query: str) -> Flow:
                 capture_manager=capture_manager,
                 policy=policy,
                 start_url=task.start_url,
-                max_steps=15,
             )
             db.refresh(flow)
             return flow
