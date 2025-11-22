@@ -47,6 +47,8 @@ class CaptureManager:
         dom_html: str,
         description: str | None = None,
         diff_summary: Optional[str] = None,
+        diff_score: Optional[float] = None,
+        action_description: str | None = None,
         step_index: Optional[int] = None,
     ) -> Step:
         if step_index is None:
@@ -70,7 +72,7 @@ class CaptureManager:
             flow_id=flow.id,
             step_index=step_index,
             state_label=label,
-            description=description or "",
+            description=description or action_description or "",
             url=page.url,
             screenshot_key=screenshot_key,
             dom_key=dom_key,

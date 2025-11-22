@@ -20,6 +20,28 @@ async def run_agent_loop(
     async with BrowserSession() as browser:
         await browser.goto(start_url)
 
+        page = browser.page
+        if page is None:
+            return
+
+        dom_html = await capture_manager.get_dom_snapshot(page)
+        await capture_manager.capture_step(
+            page=page,
+            flow=flow,
+            label="initial_state",
+            dom_html=dom_html,
+            diff_summary=None,
+            diff_score=None,
+            action_description="initial page load",
+        )
+
+        candidates = await scan_candidate_actions(page, max_actions=60)
+        if not candidates:
+            print("[agent_loop] No candidate actions after initial load, finishing")
+            flow.status = "no_actions"
+            flow.save()
+            return
+
         history_summary = ""
 
         for step_index in range(1, max_steps + 1):
@@ -29,7 +51,8 @@ async def run_agent_loop(
 
             dom_before = await capture_manager.get_dom_snapshot(page)
 
-            candidates = await scan_candidate_actions(page)
+            if step_index != 1:
+                candidates = await scan_candidate_actions(page, max_actions=60)
             print(f"[agent_loop] URL={page.url} candidates={len(candidates)}")
             if not candidates:
                 capture_manager.finish_flow(flow, status="no_actions")
