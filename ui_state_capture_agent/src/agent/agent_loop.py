@@ -1,4 +1,7 @@
+from datetime import datetime, timezone
+
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+from sqlalchemy.orm import Session
 
 from .task_spec import TaskSpec
 from .dom_scanner import scan_candidate_actions
@@ -9,6 +12,22 @@ from ..models import Flow
 from .state_diff import compute_dom_diff
 
 
+def _set_cancelled(flow: Flow, session: Session) -> None:
+    flow.status = "cancelled"
+    flow.status_reason = "cancel_requested"
+    flow.finished_at = datetime.now(timezone.utc)
+    session.add(flow)
+    session.commit()
+
+
+async def _check_cancel_requested(session: Session, flow: Flow) -> bool:
+    refreshed = session.get(Flow, flow.id)
+    if refreshed and refreshed.cancel_requested:
+        _set_cancelled(flow, session)
+        return True
+    return False
+
+
 async def run_agent_loop(
     task: TaskSpec,
     flow: Flow,
@@ -17,6 +36,7 @@ async def run_agent_loop(
     start_url: str,
     max_steps: int = 15,
 ) -> None:
+    session = capture_manager.db_session
     async with BrowserSession() as browser:
         await browser.goto(start_url)
 
@@ -44,10 +64,34 @@ async def run_agent_loop(
 
         history_summary = ""
 
+        page = browser.page
+        if page is None:
+            return
+
+        dom_initial = await capture_manager.get_dom_snapshot(page)
+        await capture_manager.capture_step(
+            page=page,
+            flow=flow,
+            label="initial",
+            description="Initial state",
+            dom_html=dom_initial,
+            step_index=0,
+            state_kind="initial",
+            url_changed=False,
+        )
+
+        if await _check_cancel_requested(session, flow):
+            return
+
+        previous_url = page.url
+
         for step_index in range(1, max_steps + 1):
             page = browser.page
             if page is None:
                 break
+
+            if await _check_cancel_requested(session, flow):
+                return
 
             dom_before = await capture_manager.get_dom_snapshot(page)
 
@@ -69,6 +113,8 @@ async def run_agent_loop(
                         label=decision.get("state_label_after", "done"),
                         description=decision.get("reason", ""),
                         dom_html=dom_before,
+                        url_changed=False,
+                        state_kind="dom_change",
                         step_index=step_index,
                     )
 
@@ -82,6 +128,8 @@ async def run_agent_loop(
                     label=decision.get("state_label_before") or f"before_{step_index}",
                     description=f"Before action: {decision.get('reason', '')}",
                     dom_html=dom_before,
+                    url_changed=False,
+                    state_kind="dom_change",
                     step_index=step_index,
                 )
 
@@ -119,6 +167,8 @@ async def run_agent_loop(
 
             dom_after = await capture_manager.get_dom_snapshot(page)
             diff_summary, diff_score = compute_dom_diff(dom_before, dom_after)
+            url_changed = page.url != previous_url
+            state_kind = "url_change" if url_changed else "dom_change"
 
             should_capture_after = bool(decision.get("capture_after"))
             if diff_score is not None and diff_score > 0.1:
@@ -132,6 +182,9 @@ async def run_agent_loop(
                     description=decision.get("reason", ""),
                     dom_html=dom_after,
                     diff_summary=diff_summary,
+                    diff_score=diff_score,
+                    url_changed=url_changed,
+                    state_kind=state_kind,
                     step_index=step_index,
                 )
 
@@ -139,6 +192,8 @@ async def run_agent_loop(
             history_summary = "\n".join(
                 [line for line in [history_summary, summary_line] if line]
             )
+
+            previous_url = page.url
 
         else:
             capture_manager.finish_flow(flow, status="max_steps_reached")

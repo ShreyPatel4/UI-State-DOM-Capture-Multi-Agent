@@ -165,6 +165,7 @@ def get_flow_status(flow_id: UUID, db: Session = Depends(get_db)) -> dict[str, A
     return {
         "id": str(flow.id),
         "status": flow.status,
+        "cancel_requested": flow.cancel_requested,
         "started_at": flow.started_at,
         "finished_at": flow.finished_at,
         "steps": [
@@ -177,6 +178,16 @@ def get_flow_status(flow_id: UUID, db: Session = Depends(get_db)) -> dict[str, A
             for step in steps
         ],
     }
+
+
+@app.post("/flows/{flow_id}/cancel")
+def cancel_flow(flow_id: UUID, db: Session = Depends(get_db)):
+    flow = db.get(Flow, flow_id)
+    if not flow:
+        raise HTTPException(status_code=404, detail="Flow not found")
+    flow.cancel_requested = True
+    db.commit()
+    return {"id": str(flow.id), "status": flow.status, "cancel_requested": flow.cancel_requested}
 
 
 @app.get("/flows/{flow_id}", response_class=HTMLResponse)

@@ -13,6 +13,11 @@
             <div><span class="label">Run ID</span><strong>{{ flow.run_id }}</strong></div>
             <div><span class="label">Status</span><strong class="status status-{{ flow.status | lower }}">{{ flow.status }}</strong></div>
             <div><span class="label">Started</span><strong>{{ flow.started_at }}</strong></div>
+            {% if flow.status == "running" %}
+                <div>
+                    <button id="cancel-run" class="button">Stop run</button>
+                </div>
+            {% endif %}
         </div>
     </header>
 </section>
@@ -43,4 +48,23 @@
     <p class="empty">No steps recorded for this flow.</p>
     {% endfor %}
 </section>
+{% if flow.status == "running" %}
+<script>
+    const cancelButton = document.getElementById("cancel-run");
+    if (cancelButton) {
+        cancelButton.addEventListener("click", async () => {
+            cancelButton.disabled = true;
+            cancelButton.textContent = "Stopping...";
+            try {
+                await fetch(`/flows/{{ flow.id }}/cancel`, { method: "POST" });
+                cancelButton.textContent = "Stop requested";
+            } catch (error) {
+                console.error("Failed to request cancellation", error);
+                cancelButton.disabled = false;
+                cancelButton.textContent = "Stop run";
+            }
+        });
+    }
+</script>
+{% endif %}
 {% endblock %}

@@ -48,7 +48,12 @@ class CaptureManager:
         description: str | None = None,
         diff_summary: Optional[str] = None,
         diff_score: Optional[float] = None,
+<<<<<<< ours
         action_description: str | None = None,
+=======
+        url_changed: Optional[bool] = None,
+        state_kind: Optional[str] = None,
+>>>>>>> theirs
         step_index: Optional[int] = None,
     ) -> Step:
         if step_index is None:
@@ -74,9 +79,12 @@ class CaptureManager:
             state_label=label,
             description=description or action_description or "",
             url=page.url,
+            url_changed=url_changed,
+            state_kind=state_kind,
             screenshot_key=screenshot_key,
             dom_key=dom_key,
             diff_summary=diff_summary,
+            diff_score=diff_score,
         )
         self.db_session.add(step)
         self.db_session.commit()
