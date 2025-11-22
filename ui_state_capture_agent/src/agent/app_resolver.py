@@ -35,19 +35,23 @@ class AppResolver:
 
         app = None
         lower = text.lower()
-        for name in self.known_apps:
-            if name in lower:
-                app = name
-                break
-
-        if not app and candidate_app:
+        if candidate_app:
             app = candidate_app
 
         if not app:
-            app = "linear"
+            for name in self.known_apps:
+                if name in lower:
+                    app = name
+                    break
+
+        if not app:
+            tokens = goal.split()
+            app = tokens[0].lower() if tokens else ""
 
         app = app.lower()
-        start_url = self.known_apps.get(app, f"https://{app}.com")
+        start_url = self.known_apps.get(app) if app else ""
+        if not start_url and app:
+            start_url = f"https://{app}.com"
 
         return AppResolution(
             app_name=app,
