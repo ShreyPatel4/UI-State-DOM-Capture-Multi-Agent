@@ -13,16 +13,18 @@ class Policy:
     LLM backed policy that chooses the next UI action using a Hugging Face model.
     """
 
-    def __init__(self) -> None:
-        model_name = settings.hf_model_name
+    def __init__(self, model_name: str | None = None) -> None:
+        model_name = model_name or settings.hf_model_name
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        model = AutoModelForCausalLM.from_pretrained(model_name)
+
         self.generator = pipeline(
             "text-generation",
-            model=AutoModelForCausalLM.from_pretrained(model_name),
+            model=model,
             tokenizer=self.tokenizer,
-            max_new_tokens=384,
+            device="cpu",
+            max_new_tokens=128,
             do_sample=False,
-            temperature=0.1,
         )
 
     def _build_prompt(
