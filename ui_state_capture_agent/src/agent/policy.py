@@ -9,6 +9,23 @@ from .dom_scanner import CandidateAction
 from .task_spec import TaskSpec
 
 
+def _extract_json(text: str) -> dict | None:
+    """
+    Try to extract and parse the first JSON object from an LLM response.
+    Returns a dict or None if parsing fails.
+    """
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+
+    candidate = text[start : end + 1]
+    try:
+        return json.loads(candidate)
+    except json.JSONDecodeError:
+        return None
+
+
 @dataclass
 class PolicyDecision:
     action_id: str
@@ -115,14 +132,6 @@ def build_policy_prompt(
     return "\n".join(lines)
 
 
-def _extract_first_json_object(text: str) -> Optional[str]:
-    start = text.find("{")
-    end = text.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        return None
-    return text[start : end + 1]
-
-
 def choose_fallback_action(
     goal: str, candidates: Sequence[CandidateAction]
 ) -> CandidateAction:
@@ -156,27 +165,23 @@ class PolicyLLMClient:
     def generate(self, prompt: str) -> str:
         return self.hf_pipeline(prompt, num_return_sequences=1)[0]["generated_text"]
 
+    def complete(self, prompt: str) -> str:
+        return self.generate(prompt)
+
 
 def choose_action_with_llm(
-    llm_client: PolicyLLMClient,
+    llm: PolicyLLMClient,
     task: TaskSpec,
     app_name: str,
     url: str,
     history_summary: str,
     candidates: Sequence[CandidateAction],
 ) -> PolicyDecision:
-    prompt = build_policy_prompt(
-        task=task,
-        app_name=app_name,
-        url=url,
-        history_summary=history_summary,
-        candidates=candidates,
-    )
-    raw = llm_client.generate(prompt)
+    prompt = build_policy_prompt(task, app_name, url, history_summary, candidates)
+    raw = llm.complete(prompt).strip()
 
-    try:
-        data = _extract_json(raw)
-    except ValueError:
+    data = _extract_json(raw)
+    if data is None:
         fallback = choose_fallback_action(task.goal, candidates)
         return PolicyDecision(
             action_id=fallback.id,
@@ -189,48 +194,34 @@ def choose_action_with_llm(
             reason="Fallback decision because model output was not valid JSON",
         )
 
-    valid_ids = {c.id for c in candidates}
-    if data.get("action_id") not in valid_ids:
-        first = candidates[0]
-        data["action_id"] = first.id
-        data["action_type"] = first.action_type
+    action_id = data.get("action_id")
+    cand_map = {c.id: c for c in candidates}
+    if action_id not in cand_map:
+        fallback = choose_fallback_action(task.goal, candidates)
+        return PolicyDecision(
+            action_id=fallback.id,
+            action_type=fallback.action_type,
+            text=None,
+            done=False,
+            capture_before=True,
+            capture_after=True,
+            label=f"after_{fallback.id}",
+            reason="Fallback decision because model output did not match a candidate id",
+        )
 
-    data.setdefault("text", None)
-    data.setdefault("capture_before", True)
-    data.setdefault("capture_after", True)
-    data.setdefault("label", f"after_{data['action_id']}")
-    data.setdefault("done", False)
-    data.setdefault("reason", "Model did not provide a reason")
+    cand = cand_map[action_id]
+    action_type = data.get("action_type") or cand.action_type
 
-    decision = PolicyDecision(
-        action_id=data.get("action_id"),
-        action_type=data.get("action_type", "click"),
+    return PolicyDecision(
+        action_id=action_id,
+        action_type=action_type,
         text=data.get("text"),
-        done=bool(data.get("done")),
-        capture_before=bool(data.get("capture_before")),
-        capture_after=bool(data.get("capture_after")),
+        done=bool(data.get("done", False)),
+        capture_before=bool(data.get("capture_before", True)),
+        capture_after=bool(data.get("capture_after", True)),
         label=data.get("label"),
         reason=data.get("reason"),
     )
-
-    print(
-        "[policy] decision:",
-        json.dumps(
-            {
-                "app": task.app_name,
-                "goal": task.goal,
-                "action_id": decision.action_id,
-                "action_type": decision.action_type,
-                "capture_before": decision.capture_before,
-                "capture_after": decision.capture_after,
-                "label": decision.label,
-                "done": decision.done,
-            },
-            ensure_ascii=False,
-        ),
-    )
-
-    return decision
 
 
 class Policy:
@@ -251,13 +242,10 @@ class Policy:
         return out
 
     def _extract_json(self, raw: str) -> dict:
-        json_str = _extract_first_json_object(raw.strip())
-        if not json_str:
-            raise ValueError("no_json_object")
-        try:
-            return json.loads(json_str)
-        except json.JSONDecodeError:
+        data = _extract_json(raw.strip())
+        if data is None:
             raise ValueError("bad_json")
+        return data
 
     async def choose_action(
         self,
