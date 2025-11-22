@@ -2,7 +2,14 @@ from __future__ import annotations
 
 import os
 
-from playwright.async_api import Browser, BrowserContext, Page, Playwright, async_playwright
+from playwright.async_api import (
+    Browser,
+    BrowserContext,
+    Page,
+    Playwright,
+    TimeoutError as PlaywrightTimeoutError,
+    async_playwright,
+)
 
 from src.config import settings
 
@@ -32,10 +39,21 @@ class BrowserSession:
         if self._playwright:
             await self._playwright.stop()
 
-    async def goto(self, url: str):
+    async def goto(self, url: str, wait_ms: int = 1500) -> None:
+        """
+        Navigate to a URL and give the app a moment to hydrate.
+        """
         if not self.page:
             raise RuntimeError("Browser page is not initialized. Use within an async context manager.")
-        return await self.page.goto(url)
+
+        await self.page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        try:
+            await self.page.wait_for_load_state("networkidle", timeout=5000)
+        except PlaywrightTimeoutError:
+            print("[browser] networkidle wait timed out, continuing anyway")
+
+        if wait_ms > 0:
+            await self.page.wait_for_timeout(wait_ms)
 
     async def screenshot(self, path: str):
         if not self.page:
