@@ -8,7 +8,7 @@ from .dom_scanner import scan_candidate_actions
 from .policy import Policy
 from .browser import BrowserSession
 from .capture import CaptureManager
-from ..models import Flow
+from ..models import Flow, log_flow_event
 from .state_diff import compute_dom_diff
 
 MAX_STEPS = 10
@@ -87,6 +87,8 @@ async def run_agent_loop(
             if page is None:
                 break
 
+            captured = False
+
             if await _check_cancel_requested(session, flow):
                 return
 
@@ -116,6 +118,15 @@ async def run_agent_loop(
                         step_index=step_index,
                     )
 
+                    captured = True
+
+                log_flow_event(
+                    session,
+                    flow,
+                    "INFO",
+                    f"step={step_index} url={page.url} action='{decision.reason or decision.label or 'done'}' diff=None captured={captured}",
+                )
+
                 goal_reached = True
                 break
 
@@ -134,6 +145,8 @@ async def run_agent_loop(
                     state_kind="dom_change",
                     step_index=step_index,
                 )
+
+                captured = True
 
             cand = next((c for c in candidates if c.id == decision.action_id), candidates[0])
 
@@ -205,6 +218,8 @@ async def run_agent_loop(
                     step_index=step_index,
                 )
 
+                captured = True
+
             summary_line = f"{step_index}. {decision.reason or ''}".strip()
             history_summary = "\n".join(
                 [line for line in [history_summary, summary_line] if line]
@@ -212,6 +227,14 @@ async def run_agent_loop(
 
             prev_url = current_url
             prev_dom = current_dom
+
+            diff_str = f"{diff_score:.3f}" if diff_score is not None else "None"
+            log_flow_event(
+                session,
+                flow,
+                "INFO",
+                f"step={step_index} url={current_url} action='{cand.description}' diff={diff_str} captured={captured}",
+            )
 
             if diff_score is None or diff_score < LOW_DIFF_THRESHOLD:
                 low_diff_streak += 1

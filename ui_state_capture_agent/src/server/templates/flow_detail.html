@@ -13,6 +13,9 @@
             <div><span class="label">Run ID</span><strong>{{ flow.run_id }}</strong></div>
             <div><span class="label">Status</span><strong class="status status-{{ flow.status | lower }}">{{ flow.status }}</strong></div>
             <div><span class="label">Started</span><strong>{{ flow.started_at }}</strong></div>
+            <div>
+                <a class="button" href="{{ url_for('flow_logs', flow_id=flow.id) }}" target="_blank" rel="noopener noreferrer">View logs</a>
+            </div>
             {% if flow.status == "running" %}
                 <div>
                     <button id="cancel-run" class="button">Stop run</button>

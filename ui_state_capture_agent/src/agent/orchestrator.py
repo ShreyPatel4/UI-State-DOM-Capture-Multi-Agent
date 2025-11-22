@@ -1,6 +1,6 @@
 import asyncio
 
-from ..models import SessionLocal, Flow
+from ..models import Flow, SessionLocal, log_flow_event
 from .task_spec import TaskSpec, parse_task_query
 from .capture import CaptureManager
 from .policy import Policy
@@ -56,6 +56,13 @@ async def run_task_query_async(raw_query: str) -> Flow:
                 task_blurb=f"Auto run for query: {raw_query}",
             )
 
+            log_flow_event(
+                db,
+                flow,
+                "INFO",
+                f"Flow started app={task.app_name} start_url={task.start_url} goal={task.goal}",
+            )
+
             policy = Policy()
 
             await run_agent_loop(
@@ -66,6 +73,12 @@ async def run_task_query_async(raw_query: str) -> Flow:
                 start_url=task.start_url,
             )
             db.refresh(flow)
+            log_flow_event(
+                db,
+                flow,
+                "INFO",
+                f"Flow ended status={flow.status} reason={flow.status_reason or ''}",
+            )
             return flow
         finally:
             db.close()

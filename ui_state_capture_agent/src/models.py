@@ -5,7 +5,7 @@ from typing import Optional
 
 from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text, create_engine, func
 from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy.orm import Mapped, declarative_base, mapped_column, relationship, sessionmaker
+from sqlalchemy.orm import Mapped, Session, declarative_base, mapped_column, relationship, sessionmaker
 
 from .config import settings
 
@@ -65,6 +65,12 @@ class FlowLog(Base):
     message: Mapped[str] = mapped_column(Text)
 
     flow: Mapped["Flow"] = relationship("Flow", back_populates="logs")
+
+
+def log_flow_event(session: Session, flow: Flow, level: str, message: str) -> None:
+    log = FlowLog(flow_id=flow.id, level=level, message=message)
+    session.add(log)
+    session.commit()
 
 
 def get_db():

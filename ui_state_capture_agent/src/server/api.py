@@ -5,6 +5,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, List
 from uuid import UUID
+import uuid
 
 from fastapi import Depends, FastAPI, Form, HTTPException, Request, status
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
@@ -14,7 +15,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from ..agent.orchestrator import run_task_query_async
-from ..models import Flow, Step, get_db
+from ..models import Flow, FlowLog, Step, get_db
 from ..storage.base import StorageBackend
 from ..storage.minio_store import get_storage
 
@@ -178,6 +179,20 @@ def get_flow_status(flow_id: UUID, db: Session = Depends(get_db)) -> dict[str, A
             for step in steps
         ],
     }
+
+
+@app.get("/flows/{flow_id}/logs")
+def flow_logs(flow_id: uuid.UUID, db: Session = Depends(get_db)):
+    logs = (
+        db.query(FlowLog)
+        .filter(FlowLog.flow_id == flow_id)
+        .order_by(FlowLog.created_at.asc())
+        .all()
+    )
+    return [
+        {"created_at": l.created_at.isoformat(), "level": l.level, "message": l.message}
+        for l in logs
+    ]
 
 
 @app.post("/flows/{flow_id}/cancel")
