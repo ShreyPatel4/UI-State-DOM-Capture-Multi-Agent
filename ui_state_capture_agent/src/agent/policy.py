@@ -1,27 +1,121 @@
 import json
 from dataclasses import dataclass
-from typing import Dict, List, Literal
+from typing import Literal, Optional, Sequence
 
-from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
+from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
 
 from ..config import settings
-from .task_spec import TaskSpec
 from .dom_scanner import CandidateAction
+from .task_spec import TaskSpec
 
 
 @dataclass
 class PolicyDecision:
     action_id: str
     action_type: Literal["click", "type"]
-    text: str | None
+    text: Optional[str]
     done: bool
     capture_before: bool
     capture_after: bool
-    label: str | None
-    reason: str | None
+    label: Optional[str]
+    reason: Optional[str]
 
 
-def _extract_first_json_object(text: str) -> str | None:
+POLICY_SYSTEM_PROMPT = """
+You are a UI navigation agent inside a multi agent system.
+
+You do not see raw HTML. You only see:
+  • The user goal for this run.
+  • The current app name.
+  • The current page URL.
+  • A short natural language summary of what has already happened.
+  • A list of candidate actions extracted from the DOM.
+
+Each candidate action has:
+  • id: an identifier such as "btn_0", "link_3", "input_2".
+  • action_type: either "click" or "type".
+  • description: a short human description such as "button with text 'Create issue'" or "input with placeholder 'Title'".
+
+Your job is to pick the single best next action to move toward the goal.
+
+Very important:
+  • You must always choose exactly one of the provided candidates. Never invent new ids.
+  • If the goal requires typing text (for example "create issue named Softlight test"), choose a candidate with action_type "type" and provide the text field.
+  • If the goal requires clicking navigation or confirmation controls, choose a candidate with action_type "click".
+  • You should think step by step about the goal and what state we are currently in before choosing.
+
+Captures and state labels:
+  • The engine has already captured the initial page after navigation, so you do not need to handle the very first screenshot.
+  • Use capture_before=true when this action will show an interesting "before" state, for example before opening a modal or before submitting a form.
+  • Use capture_after=true when the action is likely to visibly change the UI, for example:
+      • opening a modal or dropdown
+      • moving to a different page or tab
+      • applying a filter or creating a new entity
+  • Set label to a short snake_case description of the state after the action, for example:
+      • "issue_form_open"
+      • "issue_created"
+      • "pricing_page_open"
+
+Done flag:
+  • If you believe the user goal will be satisfied after this action and the resulting state is visible, set done=true.
+  • Examples:
+      • After clicking a "Create issue" button that submits a filled form and the goal is "create issue named X".
+      • After clicking a "Pricing" link when the goal is "open the pricing page and capture one screenshot".
+  • Otherwise, set done=false and the engine will call you again with an updated history.
+
+Output requirements:
+  • You must return exactly one JSON object.
+  • The JSON must match this schema exactly:
+       {
+         "action_id": "<one of the candidate ids>",
+         "action_type": "click" or "type",
+         "text": null or "<text to type>",
+         "done": true or false,
+         "capture_before": true or false,
+         "capture_after": true or false,
+         "label": null or "<short_snake_case_state_label>",
+         "reason": "<short natural language reason>"
+       }
+  • Return only JSON. Do not include any explanation outside of the JSON object.
+"""
+
+
+def build_policy_prompt(
+    task: TaskSpec,
+    app_name: str,
+    url: str,
+    history_summary: str,
+    candidates: Sequence[CandidateAction],
+) -> str:
+    """
+    Build the text prompt for Qwen.
+    """
+    lines: list[str] = []
+    lines.append(POLICY_SYSTEM_PROMPT.strip())
+    lines.append("")
+    lines.append("User goal:")
+    lines.append(task.goal)
+    lines.append("")
+    lines.append(f"App name: {app_name}")
+    lines.append(f"Current URL: {url}")
+    lines.append("")
+    lines.append("History summary:")
+    lines.append(history_summary if history_summary else "(no previous actions)")
+    lines.append("")
+    lines.append("Candidate actions:")
+    for cand in candidates:
+        lines.append(
+            f"  - id={cand.id}  type={cand.action_type}  description={cand.description}"
+        )
+    lines.append("")
+    lines.append(
+        "Return a single JSON object that follows the schema exactly. "
+        "Do not include any text before or after the JSON."
+    )
+    return "\n".join(lines)
+
+
+def _extract_first_json_object(text: str) -> Optional[str]:
     start = text.find("{")
     end = text.rfind("}")
     if start == -1 or end == -1 or end <= start:
@@ -29,7 +123,9 @@ def _extract_first_json_object(text: str) -> str | None:
     return text[start : end + 1]
 
 
-def choose_fallback_action(goal: str, candidates: list[CandidateAction]) -> CandidateAction:
+def choose_fallback_action(
+    goal: str, candidates: Sequence[CandidateAction]
+) -> CandidateAction:
     def score(cand: CandidateAction) -> int:
         g = set(goal.lower().split())
         d = set(cand.description.lower().split())
@@ -57,52 +153,6 @@ class Policy:
             do_sample=False,
         )
 
-    def _build_prompt(
-        self,
-        task: TaskSpec,
-        candidates: List[CandidateAction],
-        history_summary: str,
-    ) -> str:
-        actions_text = "\n".join(
-            f"{idx + 1}. id={c.id} action_type={c.action_type} description={c.description}"
-            for idx, c in enumerate(candidates)
-        )
-
-        prompt = f"""
-You are a UI agent controlling a web browser.
-
-Your goal is to complete the user's task by choosing the next best UI action.
-
-Task:
-  app: {task.app_name}
-  goal: {task.goal}
-  object_type: {task.object_type}
-
-Recent history (previous steps):
-{history_summary or "none"}
-
-You have these candidate actions on the current page:
-{actions_text}
-
-Choose ONE best next action.
-
-Respond ONLY with valid JSON using this schema:
-
-{{
-  "action_id": "act_3",
-  "action_type": "click" | "type",
-  "text": "text to type when action_type is type",
-  "capture_before": true,
-  "capture_after": true,
-  "label": "state label after action",
-  "done": false,
-  "reason": "short explanation of your choice"
-}}
-
-Do NOT include any extra commentary outside the JSON.
-"""
-        return prompt.strip()
-
     def _run_hf(self, prompt: str) -> str:
         out = self.generator(
             prompt,
@@ -110,7 +160,7 @@ Do NOT include any extra commentary outside the JSON.
         )[0]["generated_text"]
         return out
 
-    def _extract_json(self, raw: str) -> Dict:
+    def _extract_json(self, raw: str) -> dict:
         json_str = _extract_first_json_object(raw.strip())
         if not json_str:
             raise ValueError("no_json_object")
@@ -122,13 +172,20 @@ Do NOT include any extra commentary outside the JSON.
     async def choose_action(
         self,
         task: TaskSpec,
-        candidates: List[CandidateAction],
+        candidates: Sequence[CandidateAction],
         history_summary: str,
+        url: str,
     ) -> PolicyDecision:
         """
         Decide the next action. Called from the agent loop.
         """
-        prompt = self._build_prompt(task, candidates, history_summary)
+        prompt = build_policy_prompt(
+            task=task,
+            app_name=task.app_name,
+            url=url,
+            history_summary=history_summary,
+            candidates=candidates,
+        )
         raw = self._run_hf(prompt)
 
         try:

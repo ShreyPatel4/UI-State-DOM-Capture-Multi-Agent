@@ -100,7 +100,9 @@ async def run_agent_loop(
                 break
 
             print(f"[agent_loop] history_summary length={len(history_summary or '')}")
-            decision = await policy.choose_action(task, candidates, history_summary)
+            decision = await policy.choose_action(
+                task, candidates, history_summary, page.url
+            )
 
             if decision.done:
                 if decision.capture_after:
