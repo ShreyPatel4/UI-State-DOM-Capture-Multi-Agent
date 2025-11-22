@@ -14,6 +14,8 @@ class Settings(BaseSettings):
     minio_bucket: str = "ui-state-capture"
     llm_provider: str = "huggingface"
     hf_model_name: str = "microsoft/Phi-3-mini-4k-instruct"
+    transformers_cache: str | None = None
+    hf_home: str | None = None
     headless: bool = True
 
     class Config:
