@@ -1,5 +1,3 @@
-from typing import Optional
-
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from .task_spec import TaskSpec
@@ -8,7 +6,7 @@ from .policy import Policy
 from .browser import BrowserSession
 from .capture import CaptureManager
 from ..models import Flow
-from .state_diff import diff_dom
+from .state_diff import compute_dom_diff
 
 
 async def run_agent_loop(
@@ -22,7 +20,6 @@ async def run_agent_loop(
     async with BrowserSession() as browser:
         await browser.goto(start_url)
 
-        prev_dom: Optional[str] = None
         history_summary = ""
 
         for step_index in range(1, max_steps + 1):
@@ -30,8 +27,7 @@ async def run_agent_loop(
             if page is None:
                 break
 
-            current_dom = await browser.get_dom()
-            dom_diff = diff_dom(prev_dom, current_dom)  # noqa: F841
+            dom_before = await capture_manager.get_dom_snapshot(page)
 
             candidates = await scan_candidate_actions(page)
             print(f"[agent_loop] URL={page.url} candidates={len(candidates)}")
@@ -44,30 +40,26 @@ async def run_agent_loop(
 
             if decision.get("done"):
                 if decision.get("capture_after"):
-                    screenshot_bytes = await page.screenshot(full_page=True)
-                    capture_manager.capture_step(
+                    await capture_manager.capture_step(
+                        page=page,
                         flow=flow,
-                        step_index=step_index,
-                        state_label=decision.get("state_label_after", "done"),
+                        label=decision.get("state_label_after", "done"),
                         description=decision.get("reason", ""),
-                        page_url=page.url,
-                        screenshot_bytes=screenshot_bytes,
-                        dom_html=current_dom,
+                        dom_html=dom_before,
+                        step_index=step_index,
                     )
 
                 capture_manager.finish_flow(flow, status="success")
                 break
 
             if decision.get("capture_before"):
-                screenshot_bytes = await page.screenshot(full_page=True)
-                capture_manager.capture_step(
+                await capture_manager.capture_step(
+                    page=page,
                     flow=flow,
-                    step_index=step_index,
-                    state_label=f"before_{step_index}",
+                    label=decision.get("state_label_before") or f"before_{step_index}",
                     description=f"Before action: {decision.get('reason', '')}",
-                    page_url=page.url,
-                    screenshot_bytes=screenshot_bytes,
-                    dom_html=current_dom,
+                    dom_html=dom_before,
+                    step_index=step_index,
                 )
 
             cand = next((c for c in candidates if c.id == decision.get("chosen_action_id")), candidates[0])
@@ -102,18 +94,22 @@ async def run_agent_loop(
 
             await page.wait_for_timeout(1000)
 
-            new_dom = await browser.get_dom()
+            dom_after = await capture_manager.get_dom_snapshot(page)
+            diff_summary, diff_score = compute_dom_diff(dom_before, dom_after)
 
-            if decision.get("capture_after"):
-                screenshot_bytes = await page.screenshot(full_page=True)
-                capture_manager.capture_step(
+            should_capture_after = bool(decision.get("capture_after"))
+            if diff_score is not None and diff_score > 0.1:
+                should_capture_after = True
+
+            if should_capture_after:
+                await capture_manager.capture_step(
+                    page=page,
                     flow=flow,
-                    step_index=step_index,
-                    state_label=decision.get("state_label_after", f"after_{step_index}"),
+                    label=decision.get("state_label_after") or "state_changed",
                     description=decision.get("reason", ""),
-                    page_url=page.url,
-                    screenshot_bytes=screenshot_bytes,
-                    dom_html=new_dom,
+                    dom_html=dom_after,
+                    diff_summary=diff_summary,
+                    step_index=step_index,
                 )
 
             summary_line = f"{step_index}. {decision.get('reason', '')}".strip()
@@ -121,6 +117,5 @@ async def run_agent_loop(
                 [line for line in [history_summary, summary_line] if line]
             )
 
-            prev_dom = new_dom
         else:
             capture_manager.finish_flow(flow, status="max_steps_reached")

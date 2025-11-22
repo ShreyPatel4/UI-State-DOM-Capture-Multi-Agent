@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from typing import Optional
 
+from playwright.async_api import Page
 from sqlalchemy.orm import Session
 
 from ..config import settings
@@ -13,6 +15,9 @@ class CaptureManager:
     def __init__(self, db_session: Session, storage: StorageBackend) -> None:
         self.db_session = db_session
         self.storage = storage
+
+    async def get_dom_snapshot(self, page: Page) -> str:
+        return await page.content()
 
     def start_flow(self, app_name: str, task_id: str, task_title: str, task_blurb: str) -> Flow:
         run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -34,18 +39,29 @@ class CaptureManager:
         self.db_session.refresh(flow)
         return flow
 
-    def capture_step(
+    async def capture_step(
         self,
         flow: Flow,
-        step_index: int,
-        state_label: str,
-        description: str,
-        page_url: str,
-        screenshot_bytes: bytes,
+        page: Page,
+        label: str,
         dom_html: str,
+        description: str | None = None,
+        diff_summary: Optional[str] = None,
+        step_index: Optional[int] = None,
     ) -> Step:
+        if step_index is None:
+            latest_index = (
+                self.db_session.query(Step.step_index)
+                .filter(Step.flow_id == flow.id)
+                .order_by(Step.step_index.desc())
+                .first()
+            )
+            step_index = (latest_index[0] if latest_index else 0) + 1
+
         screenshot_key = f"{flow.prefix}/step_{step_index}_screenshot.png"
         dom_key = f"{flow.prefix}/step_{step_index}_dom.html"
+
+        screenshot_bytes = await page.screenshot(full_page=True)
 
         self.storage.save_bytes(screenshot_key, screenshot_bytes)
         self.storage.save_bytes(dom_key, dom_html.encode("utf-8"))
@@ -53,11 +69,12 @@ class CaptureManager:
         step = Step(
             flow_id=flow.id,
             step_index=step_index,
-            state_label=state_label,
-            description=description,
-            url=page_url,
+            state_label=label,
+            description=description or "",
+            url=page.url,
             screenshot_key=screenshot_key,
             dom_key=dom_key,
+            diff_summary=diff_summary,
         )
         self.db_session.add(step)
         self.db_session.commit()

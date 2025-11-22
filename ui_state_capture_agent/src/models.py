@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import uuid
 
-from sqlalchemy import Column, DateTime, ForeignKey, Integer, String, create_engine, func
+from sqlalchemy import Column, DateTime, ForeignKey, Integer, String, Text, create_engine, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker
 
@@ -42,6 +42,7 @@ class Step(Base):
     url = Column(String, nullable=False)
     screenshot_key = Column(String, nullable=False)
     dom_key = Column(String, nullable=False)
+    diff_summary = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     flow = relationship("Flow", back_populates="steps")
