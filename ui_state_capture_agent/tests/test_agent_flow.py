@@ -107,6 +107,8 @@ class FakePage:
             return
         if locator == "url_change":
             self.url = "https://example.com/next"
+        if locator == "url_change2":
+            self.url = "https://example.com/final"
         self.state += 1
         if text:
             self.typed.append(text)
@@ -249,10 +251,16 @@ def test_steps_record_url_and_state(monkeypatch):
     page = FakePage()
     browser = FakeBrowserSession(page)
 
-    decisions = [make_decision("url_change"), PolicyDecision(None, "click", None, True, False, True, "done", "finish", True)]
+    decisions = [
+        make_decision("url_change"),
+        PolicyDecision("url_change2", "click", None, True, False, True, "done", "finish", True),
+    ]
 
     async def fake_scan(_page, max_actions=40):
-        return [CandidateAction(id="url_change", action_type="click", locator="url_change", description="button change")]
+        return [
+            CandidateAction(id="url_change", action_type="click", locator="url_change", description="button change"),
+            CandidateAction(id="url_change2", action_type="click", locator="url_change2", description="finish"),
+        ]
 
     def fake_choose(*_args, **_kwargs):
         return decisions.pop(0)
@@ -275,3 +283,105 @@ def test_steps_record_url_and_state(monkeypatch):
     url_change_steps = [s for s in capture_manager.steps if s["state_kind"] == "url_change"]
     assert url_change_steps
     assert url_change_steps[0]["url_changed"] is True
+
+
+def test_done_without_change_marks_uncertain(monkeypatch):
+    flow = type("Flow", (), {"id": uuid.uuid4(), "cancel_requested": False, "status": "running", "status_reason": None})()
+    session = DummySession(flow)
+    capture_manager = FakeCaptureManager(session)
+    page = FakePage()
+    browser = FakeBrowserSession(page)
+
+    decisions = [PolicyDecision("no_change", "click", None, True, False, True, "done", "finish", True)]
+
+    async def fake_scan(_page, max_actions=40):
+        return [CandidateAction(id="no_change", action_type="click", locator="no_change", description="noop")]
+
+    def fake_choose(*_args, **_kwargs):
+        return decisions.pop(0)
+
+    monkeypatch.setattr("src.agent.agent_loop.scan_candidate_actions", fake_scan)
+    monkeypatch.setattr("src.agent.agent_loop.choose_action_with_llm", fake_choose)
+
+    asyncio.run(
+        run_agent_loop(
+            task=type("Task", (), {"goal": "create issue named test", "app_name": "linear"})(),
+            flow=flow,
+            capture_manager=capture_manager,
+            hf_pipeline=None,
+            start_url=page.url,
+            browser_factory=lambda: browser,
+            max_steps=2,
+        )
+    )
+
+    assert flow.status_reason == "uncertain_goal"
+    assert any(step["state_label"] != "initial_state" for step in capture_manager.steps)
+
+
+def test_capture_goal_can_finish_after_initial(monkeypatch):
+    flow = type("Flow", (), {"id": uuid.uuid4(), "cancel_requested": False, "status": "running", "status_reason": None})()
+    session = DummySession(flow)
+    capture_manager = FakeCaptureManager(session)
+    page = FakePage()
+    browser = FakeBrowserSession(page)
+
+    decisions = [PolicyDecision("no_change", "click", None, True, False, True, "capture_done", "capture", True)]
+
+    async def fake_scan(_page, max_actions=40):
+        return [CandidateAction(id="no_change", action_type="click", locator="no_change", description="noop")]
+
+    def fake_choose(*_args, **_kwargs):
+        return decisions.pop(0)
+
+    monkeypatch.setattr("src.agent.agent_loop.scan_candidate_actions", fake_scan)
+    monkeypatch.setattr("src.agent.agent_loop.choose_action_with_llm", fake_choose)
+
+    asyncio.run(
+        run_agent_loop(
+            task=type("Task", (), {"goal": "open home page and capture one screenshot", "app_name": "linear"})(),
+            flow=flow,
+            capture_manager=capture_manager,
+            hf_pipeline=None,
+            start_url=page.url,
+            browser_factory=lambda: browser,
+            max_steps=1,
+        )
+    )
+
+    assert flow.status_reason == "goal_reached"
+    assert len(capture_manager.steps) >= 2
+
+
+def test_llm_fallback_still_captures(monkeypatch):
+    flow = type("Flow", (), {"id": uuid.uuid4(), "cancel_requested": False, "status": "running", "status_reason": None})()
+    session = DummySession(flow)
+    capture_manager = FakeCaptureManager(session)
+    page = FakePage()
+    browser = FakeBrowserSession(page)
+
+    decisions = [PolicyDecision(None, "click", None, True, False, True, "fallback", "bad json", True)]
+
+    async def fake_scan(_page, max_actions=40):
+        return [CandidateAction(id="url_change", action_type="click", locator="url_change", description="button change")]
+
+    def fake_choose(*_args, **_kwargs):
+        return decisions.pop(0)
+
+    monkeypatch.setattr("src.agent.agent_loop.scan_candidate_actions", fake_scan)
+    monkeypatch.setattr("src.agent.agent_loop.choose_action_with_llm", fake_choose)
+
+    asyncio.run(
+        run_agent_loop(
+            task=type("Task", (), {"goal": "", "app_name": "linear"})(),
+            flow=flow,
+            capture_manager=capture_manager,
+            hf_pipeline=None,
+            start_url=page.url,
+            browser_factory=lambda: browser,
+            max_steps=1,
+        )
+    )
+
+    assert flow.status_reason == "llm_fallback"
+    assert len(capture_manager.steps) >= 2

@@ -38,30 +38,32 @@ def _candidate_key(cand: CandidateAction) -> str:
     return f"{cand.action_type}:{cand.locator}:{cand.description}"
 
 
-async def _capture_if_changed(
+async def _maybe_capture_state(
     capture_manager: CaptureManager,
     page,
     flow: Flow,
     label: str,
     description: str,
-    dom_html: str,
-    prev_dom: str | None,
-    prev_url: str | None,
+    current_dom: str,
+    last_captured_dom: str | None,
+    last_captured_url: str | None,
     diff_threshold: float,
     step_index: int | None,
+    force: bool = False,
 ):
     url_changed, diff_summary, diff_score, state_kind, changed = summarize_state_change(
-        prev_dom, dom_html, prev_url, page.url, diff_threshold
+        last_captured_dom, current_dom, last_captured_url, page.url, diff_threshold
     )
-    if not changed:
-        return None, prev_dom, prev_url
+
+    if not changed and not force:
+        return None, last_captured_dom, last_captured_url, changed, state_kind, diff_score
 
     step = await capture_manager.capture_step(
         page=page,
         flow=flow,
         label=label,
         description=description,
-        dom_html=dom_html,
+        dom_html=current_dom,
         diff_summary=diff_summary,
         diff_score=diff_score,
         action_description=description,
@@ -69,7 +71,7 @@ async def _capture_if_changed(
         state_kind=state_kind,
         step_index=step_index,
     )
-    return step, dom_html, page.url
+    return step, current_dom, page.url, changed, state_kind, diff_score
 
 
 async def run_agent_loop(
@@ -86,6 +88,7 @@ async def run_agent_loop(
     max_steps = max_steps or settings.max_steps
     diff_threshold = settings.dom_diff_threshold
     max_action_failures = settings.max_action_failures
+    goal_text = task.goal.lower()
 
     failure_counts: dict[str, int] = defaultdict(int)
     banned_actions: set[str] = set()
@@ -165,7 +168,7 @@ async def run_agent_loop(
 
             if decision.action_id is None:
                 if decision.should_capture:
-                    await _capture_if_changed(
+                    await _maybe_capture_state(
                         capture_manager,
                         page,
                         flow,
@@ -176,6 +179,7 @@ async def run_agent_loop(
                         last_captured_url,
                         diff_threshold,
                         step_index,
+                        force=True,
                     )
                 flow.status = "finished"
                 flow.status_reason = "llm_fallback"
@@ -189,30 +193,8 @@ async def run_agent_loop(
                 log_flow_event(session, flow, "warning", "Selected candidate missing after filtering")
                 continue
 
-            if decision.done and decision.capture_after:
-                step, last_captured_dom, last_captured_url = await _capture_if_changed(
-                    capture_manager,
-                    page,
-                    flow,
-                    decision.label or "done",
-                    decision.reason or selected_candidate.description,
-                    prev_dom,
-                    last_captured_dom,
-                    last_captured_url,
-                    diff_threshold,
-                    step_index,
-                )
-                log_flow_event(
-                    session,
-                    flow,
-                    "info",
-                    f"step={step_index} url={page.url} action='{decision.reason or decision.label or 'done'}' captured={bool(step)}",
-                )
-                goal_reached = True
-                break
-
             if decision.capture_before:
-                step, last_captured_dom, last_captured_url = await _capture_if_changed(
+                step, last_captured_dom, last_captured_url, _, _, _ = await _maybe_capture_state(
                     capture_manager,
                     page,
                     flow,
@@ -270,26 +252,27 @@ async def run_agent_loop(
             else:
                 failure_counts[_candidate_key(selected_candidate)] = 0
 
-            if decision.capture_after and changed:
-                step, last_captured_dom, last_captured_url = await _capture_if_changed(
-                    capture_manager,
-                    page,
+            should_force_capture = bool(decision.capture_after or decision.should_capture or decision.done)
+            step, last_captured_dom, last_captured_url, captured_changed, captured_state_kind, captured_diff = await _maybe_capture_state(
+                capture_manager,
+                page,
+                flow,
+                decision.label or f"after_action_{decision.action_id}",
+                decision.reason or selected_candidate.description,
+                current_dom,
+                last_captured_dom,
+                last_captured_url,
+                diff_threshold,
+                step_index,
+                force=should_force_capture,
+            )
+            if step:
+                log_flow_event(
+                    session,
                     flow,
-                    decision.label or f"after_action_{decision.action_id}",
-                    decision.reason or selected_candidate.description,
-                    current_dom,
-                    last_captured_dom,
-                    last_captured_url,
-                    diff_threshold,
-                    step_index,
+                    "info",
+                    f"step={step_index} url={current_url} action='{selected_candidate.description}' diff={captured_diff} captured=True",
                 )
-                if step:
-                    log_flow_event(
-                        session,
-                        flow,
-                        "info",
-                        f"step={step_index} url={current_url} action='{selected_candidate.description}' diff={diff_score} captured=True",
-                    )
 
             summary_line = f"{step_index}. {decision.reason or selected_candidate.description}".strip()
             history_summary = "\n".join([line for line in [history_summary, summary_line] if line])
@@ -297,8 +280,45 @@ async def run_agent_loop(
             prev_url = current_url
             prev_dom = current_dom
 
+            if decision.done:
+                creation_like = any(
+                    keyword in goal_text
+                    for keyword in [
+                        "create",
+                        "add",
+                        "new",
+                        "save",
+                        "submit",
+                        "enable",
+                        "disable",
+                        "change",
+                        "update",
+                    ]
+                )
+                capture_goal = any(term in goal_text for term in ["capture", "screenshot"])
+                meaningful = bool(
+                    url_changed
+                    or (diff_score is not None and diff_score >= diff_threshold)
+                    or captured_state_kind == "dom_change_modal"
+                    or captured_changed
+                )
+                if meaningful or (capture_goal and not creation_like and (captured_changed or step_index == 1)):
+                    goal_reached = True
+                else:
+                    flow.status_reason = "uncertain_goal"
+                    log_flow_event(
+                        session,
+                        flow,
+                        "warning",
+                        "LLM indicated done but no meaningful change detected; finishing as uncertain",
+                    )
+                    break
+
             if banned_actions:
                 candidates = [c for c in candidates if _candidate_key(c) not in banned_actions]
+
+            if goal_reached:
+                break
 
         else:
             flow.status_reason = "max steps reached"

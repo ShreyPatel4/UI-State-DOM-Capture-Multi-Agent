@@ -103,10 +103,9 @@ Captures and state labels:
       • "pricing_page_open"
 
 Done flag:
-  • If you believe the user goal will be satisfied after this action and the resulting state is visible, set done=true.
-  • Examples:
-      • After clicking a "Create issue" button that submits a filled form and the goal is "create issue named X".
-      • After clicking a "Pricing" link when the goal is "open the pricing page and capture one screenshot".
+  • Only set done=true AFTER the action you choose would leave the UI in the completed state.
+  • For creation or mutation goals (create issue/project/item, submit/save, enable/disable), expect that a visible modal or DOM change will be captured after the action. Keep done=false until that capture should happen.
+  • For simple viewing goals ("open the pricing page and capture one screenshot"), done=true is acceptable once the correct page is visible and captured.
   • Otherwise, set done=false and the engine will call you again with an updated history.
 
 Output requirements:
