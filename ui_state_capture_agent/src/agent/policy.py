@@ -1,3 +1,5 @@
+"""Policy module remains generic with no app-specific selectors or workflows."""
+
 import json
 import re
 from dataclasses import dataclass
@@ -30,7 +32,20 @@ class PolicyDecision:
 
 POLICY_SYSTEM_PROMPT = """
 You are a deterministic UI policy that selects exactly one action for the next step.
-Return exactly one JSON object and nothing else. No prose. No lead-in sentences. No markdown. No code fences.
+Return only a single JSON object. No prose. No lead-in sentences. No markdown. No code fences.
+
+You will receive two groups of candidate UI elements:
+- clickable_ui: elements meant for clicks (navigation, confirmation, opening dialogs)
+- text_entry_ui: elements meant for typing (form fields, text editors)
+
+Each candidate includes id, tag, role, description, semantics, and other DOM hints. You must base all decisions only on these candidates and the user goal. Do not assume any app-specific behavior.
+
+Rules:
+- Use clickable_ui to navigate, open modals, confirm actions, and similar behaviors.
+- Use text_entry_ui for typing into title, name, description, or rich-text fields.
+- If the goal contains quoted phrases (e.g., "example text") and a text entry candidate has semantics such as "title_field" or its description suggests a name/title field, choose action_type="type" on that candidate with text_to_type exactly set to the quoted phrase.
+- action_id must be one of the provided candidate ids or null.
+- If action_type="type" is chosen, text_to_type must be a non-empty string.
 
 JSON schema:
 {
@@ -51,6 +66,18 @@ def build_policy_prompt(
     history_summary: str,
     candidates: Sequence[CandidateAction],
 ) -> str:
+    click_candidates = [c for c in candidates if c.action_type == "click"]
+    type_candidates = [c for c in candidates if c.action_type == "type"]
+
+    def fmt(c: CandidateAction) -> str:
+        semantics = f"[{', '.join(sorted(c.semantics))}]" if c.semantics else "[]"
+        return (
+            f"id: {c.id}, tag: {c.tag or '-'}, role: {c.role or '-'}, "
+            f"semantics: {semantics}, description: \"{c.description}\""
+        )
+
+    quoted_phrases = re.findall(r'"([^"]+)"', task.goal)
+
     lines: list[str] = []
     lines.append(POLICY_SYSTEM_PROMPT.strip())
     lines.append("")
@@ -63,12 +90,24 @@ def build_policy_prompt(
     lines.append("History summary:")
     lines.append(history_summary if history_summary else "(no previous actions)")
     lines.append("")
-    lines.append("Candidate actions (choose one id for action_id):")
-    for cand in candidates:
-        lines.append(
-            f"  - action_id={cand.id} type={cand.action_type} description={cand.description}"
-        )
+    lines.append("Clickable UI elements:")
+    if click_candidates:
+        for cand in click_candidates:
+            lines.append(f"  - {fmt(cand)}")
+    else:
+        lines.append("  - (none)")
     lines.append("")
+    lines.append("Text entry UI elements:")
+    if type_candidates:
+        for cand in type_candidates:
+            lines.append(f"  - {fmt(cand)}")
+    else:
+        lines.append("  - (none)")
+    lines.append("")
+    lines.append(f"Quoted phrases in goal: {quoted_phrases if quoted_phrases else '[]'}")
+    lines.append("")
+    lines.append("You must pick action_id from the candidate ids listed above or null.")
+    lines.append("If you choose action_type='type', you must also set text_to_type to a non-empty string.")
     lines.append(
         "Respond with exactly one JSON object and nothing else. Do not use markdown or code fences."
     )

@@ -118,8 +118,9 @@ async def run_agent_loop(
 
         log_flow_event(session, flow, "info", "Captured initial_state")
 
-        candidates = await scan_candidate_actions(page, max_actions=40)
+        candidates, type_ids = await scan_candidate_actions(page, max_actions=40)
         candidates = [c for c in candidates if _candidate_key(c) not in banned_actions]
+        type_ids = [c.id for c in candidates if c.action_type == "type"]
         if not candidates:
             flow.status = "no_actions"
             flow.status_reason = "no_candidates"
@@ -144,8 +145,9 @@ async def run_agent_loop(
                 return
 
             if step_index != 1:
-                candidates = await scan_candidate_actions(page, max_actions=40)
+                candidates, type_ids = await scan_candidate_actions(page, max_actions=40)
                 candidates = [c for c in candidates if _candidate_key(c) not in banned_actions]
+                type_ids = [c.id for c in candidates if c.action_type == "type"]
 
             if not candidates:
                 capture_manager.finish_flow(flow, status="no_actions")
@@ -153,7 +155,6 @@ async def run_agent_loop(
                 break
 
             current_url = page.url
-            type_candidates = [c.id for c in candidates if c.action_type == "type"]
             log_flow_event(
                 session,
                 flow,
@@ -162,7 +163,7 @@ async def run_agent_loop(
                     step=step_index,
                     url=current_url,
                     count=len(candidates),
-                    types=type_candidates[:5],
+                    types=type_ids[:5],
                 ),
             )
             decision: PolicyDecision = choose_action_with_llm(
