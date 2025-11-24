@@ -118,7 +118,7 @@ async def run_agent_loop(
 
         log_flow_event(session, flow, "info", "Captured initial_state")
 
-        candidates, type_ids = await scan_candidate_actions(page, max_actions=40)
+        candidates, type_ids = await scan_candidate_actions(page, max_actions=40, goal=task.goal)
         candidates = [c for c in candidates if _candidate_key(c) not in banned_actions]
         type_ids = [c.id for c in candidates if c.action_type == "type"]
         if not candidates:
@@ -145,7 +145,7 @@ async def run_agent_loop(
                 return
 
             if step_index != 1:
-                candidates, type_ids = await scan_candidate_actions(page, max_actions=40)
+                candidates, type_ids = await scan_candidate_actions(page, max_actions=40, goal=task.goal)
                 candidates = [c for c in candidates if _candidate_key(c) not in banned_actions]
                 type_ids = [c.id for c in candidates if c.action_type == "type"]
 
@@ -155,15 +155,35 @@ async def run_agent_loop(
                 break
 
             current_url = page.url
+            top_candidates = sorted(candidates, key=lambda c: c.goal_match_score, reverse=True)[:5]
+            summaries = []
+            for cand in top_candidates:
+                kind = (
+                    "primary_cta"
+                    if cand.is_primary_cta
+                    else "nav_link"
+                    if cand.is_nav_link
+                    else "form_field"
+                    if cand.is_form_field
+                    else (cand.tag or cand.action_type)
+                )
+                text_preview = cand.visible_text or cand.description
+                if len(text_preview) > 80:
+                    text_preview = text_preview[:77] + "..."
+                summaries.append(
+                    f"id={cand.id} kind={kind} text=\"{text_preview}\" score={cand.goal_match_score:.2f}"
+                )
+            summary_text = "; ".join(summaries)
             log_flow_event(
                 session,
                 flow,
                 "info",
-                "policy_call step={step} url={url} candidates={count} type_ids={types}".format(
+                "policy_call step={step} url={url} candidates={count} type_ids={types} top=[{summary}]".format(
                     step=step_index,
                     url=current_url,
                     count=len(candidates),
                     types=type_ids[:5],
+                    summary=summary_text,
                 ),
             )
             decision: PolicyDecision = choose_action_with_llm(

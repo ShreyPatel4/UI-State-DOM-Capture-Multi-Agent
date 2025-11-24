@@ -162,7 +162,7 @@ def test_respects_max_steps(monkeypatch):
 
     decisions = [make_decision("url_change"), make_decision("url_change")]
 
-    async def fake_scan(_page, max_actions=40):
+    async def fake_scan(_page, max_actions=40, goal=None):
         candidates = [
             CandidateAction(
                 id="url_change", action_type="click", locator="url_change", description="button change"
@@ -201,7 +201,7 @@ def test_bans_repeated_failures(monkeypatch):
 
     decisions = [make_decision("no_change") for _ in range(3)]
 
-    async def fake_scan(_page, max_actions=40):
+    async def fake_scan(_page, max_actions=40, goal=None):
         candidates = [
             CandidateAction(id="no_change", action_type="click", locator="no_change", description="no change")
         ]
@@ -236,7 +236,7 @@ def test_cancel_request_stops_loop(monkeypatch):
     page = FakePage()
     browser = FakeBrowserSession(page)
 
-    async def fake_scan(_page, max_actions=40):
+    async def fake_scan(_page, max_actions=40, goal=None):
         candidates = [
             CandidateAction(
                 id="url_change", action_type="click", locator="url_change", description="button change"
@@ -284,7 +284,7 @@ def test_steps_record_url_and_state(monkeypatch):
         ),
     ]
 
-    async def fake_scan(_page, max_actions=40):
+    async def fake_scan(_page, max_actions=40, goal=None):
         candidates = [
             CandidateAction(id="url_change", action_type="click", locator="url_change", description="button change"),
             CandidateAction(id="url_change2", action_type="click", locator="url_change2", description="finish"),
@@ -336,7 +336,7 @@ def test_type_action_executes_and_finishes(monkeypatch):
     ]
     call_count = {"count": 0}
 
-    async def fake_scan(_page, max_actions=40):  # noqa: ARG001
+    async def fake_scan(_page, max_actions=40, goal=None):  # noqa: ARG001
         candidates = [
             CandidateAction(
                 id="input_0", action_type="type", locator="type_input", description="Text input labeled 'Title'"
@@ -391,7 +391,7 @@ def test_done_without_change_marks_uncertain(monkeypatch):
         )
     ]
 
-    async def fake_scan(_page, max_actions=40):
+    async def fake_scan(_page, max_actions=40, goal=None):
         candidates = [CandidateAction(id="no_change", action_type="click", locator="no_change", description="noop")]
         return candidates, [c.id for c in candidates if c.action_type == "type"]
 
@@ -438,7 +438,7 @@ def test_capture_goal_can_finish_after_initial(monkeypatch):
         )
     ]
 
-    async def fake_scan(_page, max_actions=40):
+    async def fake_scan(_page, max_actions=40, goal=None):
         candidates = [CandidateAction(id="no_change", action_type="click", locator="no_change", description="noop")]
         return candidates, [c.id for c in candidates if c.action_type == "type"]
 
@@ -485,7 +485,7 @@ def test_llm_fallback_still_captures(monkeypatch):
         )
     ]
 
-    async def fake_scan(_page, max_actions=40):
+    async def fake_scan(_page, max_actions=40, goal=None):
         candidates = [
             CandidateAction(
                 id="url_change", action_type="click", locator="url_change", description="button change"
