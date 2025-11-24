@@ -45,10 +45,15 @@ Schema (all fields are required):
 
 Rules:
 - action_id MUST be either one of the candidate ids from the list OR null.
-- If action_type == "type", you MUST set text_to_type to a non empty string.
+- If action_type == "type", you MUST set text_to_type to a non empty string derived from the goal.
 - If done == true, action_id MUST be null.
 - If action_id is null and done == false, that means "no suitable action" and the controller will stop.
 - Base every decision strictly on the provided candidates and the user goal. Do not assume any app-specific behaviors.
+
+When deciding between click and type actions:
+- If the goal mentions creating, naming, or titling something (for example "create issue named X" or "new project titled Y") and there is a candidate that is a text input or form field whose label or nearby text suggests it captures that name/title, you should select that candidate with action_type="type" and set text_to_type to the relevant text from the goal.
+- When you choose action_type="type", text_to_type MUST be a non-empty string taken from the user goal.
+- Consider clicking any obvious "create" or "new" buttons first if required to reveal a form, then type into the appropriate text field.
 
 Output format requirements:
 - You MUST respond with a single JSON object that matches this schema.
@@ -66,8 +71,14 @@ def build_policy_prompt(
     candidates: Sequence[CandidateAction],
 ) -> str:
     def fmt(c: CandidateAction) -> str:
-        kind = "primary_cta" if c.is_primary_cta else "nav_link" if c.is_nav_link else "form_field" if c.is_form_field else (
-            c.kind or c.tag or "-"
+        kind = (
+            "primary_cta"
+            if c.is_primary_cta
+            else "nav_link"
+            if c.is_nav_link
+            else "form_field"
+            if c.is_form_field
+            else (c.kind or c.tag or "-")
         )
         visible_text = (c.visible_text or c.text or "").strip()
         section = c.section_label or "-"
@@ -100,6 +111,9 @@ def build_policy_prompt(
     lines.append("")
     lines.append(f"Quoted phrases in goal: {quoted_phrases if quoted_phrases else '[]'}")
     lines.append("")
+    lines.append(
+        "If a form_field/text input matches a title or name in the goal, choose action_type='type' and set text_to_type accordingly."
+    )
     lines.append("Follow the schema and output requirements exactly. Return only the JSON object.")
     return "\n".join(lines)
 

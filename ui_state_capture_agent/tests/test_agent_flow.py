@@ -75,12 +75,16 @@ class FakeCaptureManager:
 
 
 class FakeLocator:
-    def __init__(self, page, locator: str):
+    def __init__(self, page, locator: str, count_value: int = 1):
         self.page = page
         self.locator = locator
+        self.count_value = count_value
 
     async def is_visible(self):
-        return True
+        return self.count_value > 0
+
+    async def count(self):
+        return self.count_value
 
     async def click(self, timeout: int = 2000):
         if self.locator == "timeout":
@@ -101,7 +105,8 @@ class FakePage:
         self.typed: list[str] = []
 
     def locator(self, locator: str):
-        return FakeLocator(self, locator)
+        count_value = 0 if locator == "missing" else 1
+        return FakeLocator(self, locator, count_value)
 
     async def wait_for_timeout(self, _ms: int):
         return None
@@ -368,6 +373,55 @@ def test_type_action_executes_and_finishes(monkeypatch):
     assert flow.status_reason == "goal_reached"
     assert any("typed value='Hello world'" in log.message for log in session.logs)
     assert call_count["count"] == 1
+
+
+def test_missing_type_target_sets_fallback(monkeypatch):
+    flow = type("Flow", (), {"id": uuid.uuid4(), "cancel_requested": False, "status": "running", "status_reason": None})()
+    session = DummySession(flow)
+    capture_manager = FakeCaptureManager(session)
+    page = FakePage()
+    browser = FakeBrowserSession(page)
+
+    decisions = [
+        PolicyDecision(
+            action_id="input_0",
+            action_type="type",
+            text_to_type="Title text",
+            done=False,
+            capture_before=False,
+            capture_after=True,
+            label="type_title",
+            reason="typing",
+            should_capture=True,
+        )
+    ]
+
+    async def fake_scan(_page, max_actions=40, goal=None):  # noqa: ARG001
+        candidates = [
+            CandidateAction(id="input_0", action_type="type", locator="missing", description="Missing input"),
+        ]
+        return candidates, [c.id for c in candidates if c.action_type == "type"]
+
+    def fake_choose(*_args, **_kwargs):  # noqa: ARG001
+        return decisions[0]
+
+    monkeypatch.setattr("src.agent.agent_loop.scan_candidate_actions", fake_scan)
+    monkeypatch.setattr("src.agent.agent_loop.choose_action_with_llm", fake_choose)
+
+    asyncio.run(
+        run_agent_loop(
+            task=type("Task", (), {"goal": "type a title", "app_name": "linear"})(),
+            flow=flow,
+            capture_manager=capture_manager,
+            hf_pipeline=None,
+            start_url=page.url,
+            browser_factory=lambda: browser,
+            max_steps=2,
+        )
+    )
+
+    assert flow.status_reason == "type_target_missing"
+    assert any(step["state_label"] == "type_target_missing" for step in capture_manager.steps)
 
 
 def test_done_without_change_marks_uncertain(monkeypatch):

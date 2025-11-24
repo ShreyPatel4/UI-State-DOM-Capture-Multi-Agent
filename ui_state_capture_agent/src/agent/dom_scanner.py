@@ -122,6 +122,21 @@ async def scan_candidate_actions(
             return None
         return value[:limit]
 
+    async def get_element_uid(handle) -> Optional[str]:
+        try:
+            return await handle.evaluate(
+                """
+                (el) => {
+                    if (!el.__softlight_uid) {
+                        el.__softlight_uid = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
+                    }
+                    return el.__softlight_uid;
+                }
+                """
+            )
+        except Exception:
+            return None
+
     async def collect_ancestor_text(handle) -> str:
         try:
             texts = await handle.evaluate(
@@ -270,6 +285,8 @@ async def scan_candidate_actions(
         lowered = candidate_text.lower()
         return float(sum(1 for tok in goal_tokens if tok in lowered))
 
+    seen_elements: Set[str] = set()
+
     # Discover clickable elements.
     clickable_selector = "button, a[href], [role='button'], [role='link'], [onclick], [tabindex]:not([tabindex='-1'])"
     clickable_locator = page.locator(clickable_selector)
@@ -310,6 +327,12 @@ async def scan_candidate_actions(
             tag_name, role, class_name, section_label, False, semantics
         )
         goal_match_score = compute_goal_score(f"{visible_text} {ancestor_text}")
+        element_uid = await get_element_uid(handle)
+        if element_uid and element_uid in seen_elements:
+            continue
+        if element_uid:
+            seen_elements.add(element_uid)
+
         candidates.append(
             CandidateAction(
                 id=f"btn_{i}" if tag_name != "a" else f"link_{i}",
@@ -339,6 +362,8 @@ async def scan_candidate_actions(
     type_selector = "input, textarea, [contenteditable], [role='textbox']"
     type_locator = page.locator(type_selector)
     type_count = await type_locator.count()
+    type_index = 0
+    allowed_input_types = {"text", "search", "email", "url", "number", "password"}
     for i in range(type_count):
         if len(candidates) >= max_actions:
             return candidates, [c.id for c in candidates if c.action_type == "type"]
@@ -347,14 +372,18 @@ async def scan_candidate_actions(
             continue
 
         tag_name = (await handle.evaluate("(el) => el.tagName.toLowerCase()")) or ""
+        contenteditable_attr = await handle.get_attribute("contenteditable")
         if tag_name == "input":
             input_type = ((await handle.get_attribute("type")) or "text").lower()
-            if input_type in {"hidden", "checkbox", "radio", "submit", "reset", "button"}:
+            if input_type not in allowed_input_types:
                 continue
         else:
             input_type = (await handle.get_attribute("type")) or None
 
         role = (await handle.get_attribute("role")) or None
+        if tag_name not in {"input", "textarea"} and not contenteditable_attr and (role or "").lower() != "textbox":
+            continue
+
         aria_label_raw = trim_text(await handle.get_attribute("aria-label"), limit=120)
         placeholder_value = trim_text(await handle.get_attribute("placeholder"), limit=120)
         element_id = (await handle.get_attribute("id")) or ""
@@ -378,11 +407,18 @@ async def scan_candidate_actions(
             "",
         )
 
-        visible_text = trim_text(primary_hint, limit=120) or text_content or aria_label or placeholder_value or ""
         ancestor_text = await collect_ancestor_text(handle)
         section_chain = await collect_section_chain(handle)
         bbox = await get_bounding_box(handle)
         section_label = infer_section_label(section_chain, bbox)
+        visible_text = (
+            trim_text(primary_hint, limit=120)
+            or text_content
+            or aria_label
+            or placeholder_value
+            or ancestor_text
+            or ""
+        )
 
         semantics = compute_semantics(
             tag=tag_name,
@@ -399,9 +435,15 @@ async def scan_candidate_actions(
         )
         goal_match_score = compute_goal_score(f"{visible_text} {ancestor_text}")
 
+        element_uid = await get_element_uid(handle)
+        if element_uid and element_uid in seen_elements:
+            continue
+        if element_uid:
+            seen_elements.add(element_uid)
+
         if tag_name == "textarea":
             base_desc = "multiline text area"
-        elif (await handle.get_attribute("contenteditable")) is not None:
+        elif contenteditable_attr is not None:
             base_desc = "editable text box"
         elif tag_name == "input":
             base_desc = f"text input ({input_type})" if input_type else "text input"
@@ -414,7 +456,7 @@ async def scan_candidate_actions(
         )
         candidates.append(
             CandidateAction(
-                id=f"input_{i}",
+                id=f"input_{type_index}",
                 locator=f"{type_selector} >> nth={i}",
                 action_type="type",
                 description=description,
@@ -436,6 +478,7 @@ async def scan_candidate_actions(
                 goal_match_score=goal_match_score,
             )
         )
+        type_index += 1
 
     type_ids = [c.id for c in candidates if c.action_type == "type"]
     return candidates, type_ids

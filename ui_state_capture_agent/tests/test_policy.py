@@ -3,6 +3,7 @@ import uuid
 from src.agent.dom_scanner import CandidateAction
 from src.agent.policy import (
     PolicyDecision,
+    build_policy_prompt,
     _extract_json,
     _validate_and_normalize_decision,
     choose_action_with_llm,
@@ -149,6 +150,41 @@ def test_choose_action_invalid_json_sets_text_none():
     )
 
     assert decision.text_to_type is None
+
+
+def test_build_policy_prompt_highlights_form_fields():
+    candidates = [
+        CandidateAction(
+            id="input_1",
+            action_type="type",
+            locator="input",
+            description="title field",
+            visible_text="Title",
+            is_form_field=True,
+            goal_match_score=2.0,
+        ),
+        CandidateAction(
+            id="btn_0",
+            action_type="click",
+            locator="btn",
+            description="Create",
+            is_primary_cta=True,
+            goal_match_score=1.0,
+        ),
+    ]
+    task = TaskSpec(
+        original_query="",
+        app_name="linear",
+        goal='create issue named "Example title"',
+        start_url="http://example.com",
+    )
+
+    prompt = build_policy_prompt(task, task.app_name, task.start_url, "", candidates)
+
+    assert "form_field" in prompt
+    assert "action_type='type'" in prompt
+    assert "title" in prompt.lower()
+    assert "goal_match_score=2.00" in prompt
 
 
 def test_validate_alias_id_preserved():

@@ -242,6 +242,35 @@ async def run_agent_loop(
                         continue
                     await locator.click(timeout=2000)
                 elif decision.action_type == "type":
+                    try:
+                        locator_count = await locator.count()
+                    except Exception:
+                        locator_count = 1
+                    if locator_count == 0:
+                        log_flow_event(
+                            session,
+                            flow,
+                            "warning",
+                            f"Target for {selected_candidate.id} missing; ending with fallback",
+                        )
+                        await _maybe_capture_state(
+                            capture_manager,
+                            page,
+                            flow,
+                            "type_target_missing",
+                            f"missing target for {selected_candidate.id}",
+                            prev_dom,
+                            last_captured_dom,
+                            last_captured_url,
+                            diff_threshold,
+                            force=True,
+                        )
+                        flow.status = "finished"
+                        flow.status_reason = "type_target_missing"
+                        flow.finished_at = datetime.now(timezone.utc)
+                        session.add(flow)
+                        session.commit()
+                        break
                     if not await locator.is_visible():
                         failure_counts[_candidate_key(selected_candidate)] += 1
                         log_flow_event(
@@ -282,10 +311,11 @@ async def run_agent_loop(
                             session,
                             flow,
                             "info",
-                            "typed value='{val}' into action='{desc}' selector='{loc}'".format(
+                            "typed value='{val}' into action='{desc}' selector='{loc}' step={step}".format(
                                 val=logged_value,
                                 desc=selected_candidate.description,
                                 loc=selected_candidate.locator,
+                                step=step_index,
                             ),
                         )
                     except PlaywrightTimeoutError:
@@ -303,10 +333,11 @@ async def run_agent_loop(
                                 session,
                                 flow,
                                 "info",
-                                "typed value='{val}' into action='{desc}' selector='{loc}'".format(
+                                "typed value='{val}' into action='{desc}' selector='{loc}' step={step}".format(
                                     val=logged_value,
                                     desc=selected_candidate.description,
                                     loc=selected_candidate.locator,
+                                    step=step_index,
                                 ),
                             )
                         except PlaywrightTimeoutError:
