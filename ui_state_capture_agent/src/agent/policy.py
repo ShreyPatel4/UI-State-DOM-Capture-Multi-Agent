@@ -18,7 +18,7 @@ from .task_spec import TaskSpec
 @dataclass
 class PolicyDecision:
     action_id: Optional[str]
-    action_type: Literal["click", "type"]
+    action_type: Literal["click", "type", "none"]
     text_to_type: Optional[str]
     capture: bool = True
     done: bool = False
@@ -31,31 +31,30 @@ class PolicyDecision:
 
 
 POLICY_SYSTEM_PROMPT = """
-You are a deterministic UI policy that selects exactly one action for the next step.
-Return only a single JSON object. No prose. No lead-in sentences. No markdown. No code fences.
+You are a deterministic UI policy that selects exactly one action for the next step on the current page.
 
-You will receive two groups of candidate UI elements:
-- clickable_ui: elements meant for clicks (navigation, confirmation, opening dialogs)
-- text_entry_ui: elements meant for typing (form fields, text editors)
-
-Each candidate includes id, tag, role, description, semantics, and other DOM hints. You must base all decisions only on these candidates and the user goal. Do not assume any app-specific behavior.
-
-Rules:
-- Use clickable_ui to navigate, open modals, confirm actions, and similar behaviors.
-- Use text_entry_ui for typing into title, name, description, or rich-text fields.
-- If the goal contains quoted phrases (e.g., "example text") and a text entry candidate has semantics such as "title_field" or its description suggests a name/title field, choose action_type="type" on that candidate with text_to_type exactly set to the quoted phrase.
-- action_id must be one of the provided candidate ids or null.
-- If action_type="type" is chosen, text_to_type must be a non-empty string.
-
-JSON schema:
+Schema (all fields are required):
 {
   "action_id": "<one of the provided candidate ids or null>",
-  "action_type": "click" or "type",
-  "text_to_type": "<text to type>" or null,
-  "capture": true or false,
-  "done": true or false,
+  "action_type": "click" | "type" | "none",
+  "text_to_type": "<text to type>" | null,
+  "capture": true | false,
+  "done": true | false,
   "notes": "<short explanation or empty string>"
 }
+
+Rules:
+- action_id MUST be either one of the candidate ids from the list OR null.
+- If action_type == "type", you MUST set text_to_type to a non empty string.
+- If done == true, action_id MUST be null.
+- If action_id is null and done == false, that means "no suitable action" and the controller will stop.
+- Base every decision strictly on the provided candidates and the user goal. Do not assume any app-specific behaviors.
+
+Output format requirements:
+- You MUST respond with a single JSON object that matches this schema.
+- Do NOT include any explanation, commentary, or Markdown.
+- Do NOT wrap the JSON in ```json``` fences.
+- Your entire response MUST be just the JSON object.
 """
 
 
@@ -66,14 +65,16 @@ def build_policy_prompt(
     history_summary: str,
     candidates: Sequence[CandidateAction],
 ) -> str:
-    click_candidates = [c for c in candidates if c.action_type == "click"]
-    type_candidates = [c for c in candidates if c.action_type == "type"]
-
     def fmt(c: CandidateAction) -> str:
-        semantics = f"[{', '.join(sorted(c.semantics))}]" if c.semantics else "[]"
+        kind = "primary_cta" if c.is_primary_cta else "nav_link" if c.is_nav_link else "form_field" if c.is_form_field else (
+            c.kind or c.tag or "-"
+        )
+        visible_text = (c.visible_text or c.text or "").strip()
+        section = c.section_label or "-"
         return (
-            f"id: {c.id}, tag: {c.tag or '-'}, role: {c.role or '-'}, "
-            f"semantics: {semantics}, description: \"{c.description}\""
+            f"id={c.id} | action_type={c.action_type} | kind={kind} | tag={c.tag or '-'} | role={c.role or '-'} | "
+            f"text=\"{visible_text}\" | section=\"{section}\" | primary={c.is_primary_cta} | nav={c.is_nav_link} | "
+            f"form_field={c.is_form_field} | goal_match_score={c.goal_match_score:.2f}"
         )
 
     quoted_phrases = re.findall(r'"([^"]+)"', task.goal)
@@ -84,33 +85,22 @@ def build_policy_prompt(
     lines.append("User goal:")
     lines.append(task.goal)
     lines.append("")
-    lines.append(f"App name: {app_name}")
-    lines.append(f"Current URL: {url}")
+    lines.append(f"App/context name (do not assume behaviors): {app_name}")
+    lines.append(f"Current page URL: {url}")
     lines.append("")
     lines.append("History summary:")
     lines.append(history_summary if history_summary else "(no previous actions)")
     lines.append("")
-    lines.append("Clickable UI elements:")
-    if click_candidates:
-        for cand in click_candidates:
-            lines.append(f"  - {fmt(cand)}")
-    else:
-        lines.append("  - (none)")
-    lines.append("")
-    lines.append("Text entry UI elements:")
-    if type_candidates:
-        for cand in type_candidates:
+    lines.append("Candidate actions (id, kind, text, section, scoring):")
+    if candidates:
+        for cand in candidates:
             lines.append(f"  - {fmt(cand)}")
     else:
         lines.append("  - (none)")
     lines.append("")
     lines.append(f"Quoted phrases in goal: {quoted_phrases if quoted_phrases else '[]'}")
     lines.append("")
-    lines.append("You must pick action_id from the candidate ids listed above or null.")
-    lines.append("If you choose action_type='type', you must also set text_to_type to a non-empty string.")
-    lines.append(
-        "Respond with exactly one JSON object and nothing else. Do not use markdown or code fences."
-    )
+    lines.append("Follow the schema and output requirements exactly. Return only the JSON object.")
     return "\n".join(lines)
 
 
@@ -192,14 +182,13 @@ def _validate_and_normalize_decision(
     step_index: int | None,
 ) -> PolicyDecision:
     candidate_ids = {c.id for c in candidates}
-    type_candidates = [c for c in candidates if c.action_type == "type"]
-    type_ids = {c.id for c in type_candidates}
 
     action_id = obj.get("action_id")
     if action_id is None and "id" in obj:
         action_id = obj.get("id")
 
-    action_type = (obj.get("action_type") or "click").lower()
+    raw_action_type = obj.get("action_type") or "click"
+    action_type = raw_action_type.lower() if isinstance(raw_action_type, str) else "click"
     text_to_type = obj.get("text_to_type")
     capture = bool(obj.get("capture", True))
     done = bool(obj.get("done", False))
@@ -215,39 +204,49 @@ def _validate_and_normalize_decision(
             )
 
     if action_id is not None and action_id not in candidate_ids:
-        log("warning", f"policy_invalid_action_id step={step_index} action_id={action_id}")
-        action_id = None
+        log(
+            "warning",
+            f"policy_invalid_action_id step={step_index} action_id={action_id} valid_ids={len(candidate_ids)}",
+        )
+        return PolicyDecision(
+            action_id=None,
+            action_type="click",
+            text_to_type=None,
+            capture=True,
+            done=True,
+            notes="fallback_invalid_action_id",
+        )
 
-    if action_type not in ("click", "type"):
+    if action_type not in {"click", "type", "none"}:
         log("warning", f"policy_invalid_action_type step={step_index} type={action_type}")
         action_type = "click"
 
+    if done and action_id is not None:
+        log("warning", f"policy_done_with_action_id step={step_index} action_id={action_id}")
+        action_id = None
+
+    if not done and action_id is None:
+        log("warning", f"policy_null_action_id_not_done step={step_index}")
+        return PolicyDecision(
+            action_id=None,
+            action_type="click",
+            text_to_type=None,
+            capture=True,
+            done=True,
+            notes="fallback_null_action_id_not_done",
+        )
+
     if action_type == "type":
         if not text_to_type or str(text_to_type).strip() == "":
-            log("warning", "policy_type_without_text")
-            action_type = "click"
-            text_to_type = None
-        elif not type_candidates:
-            log("warning", "policy_requested_type_but_no_type_candidates")
+            log("warning", f"policy_type_missing_text step={step_index}")
             return PolicyDecision(
                 action_id=None,
                 action_type="click",
                 text_to_type=None,
                 capture=True,
                 done=True,
-                notes="fallback_due_to_type_without_candidates",
+                notes="fallback_type_missing_text",
             )
-        elif action_id is not None and action_id not in type_ids:
-            log("warning", "policy_type_action_on_non_type_candidate")
-            action_id = next(iter(type_ids))
-
-    if action_id is None and not done and candidates:
-        fallback = candidates[0]
-        log(
-            "info",
-            f"policy_missing_action_id_using_first_candidate id={fallback.id}",
-        )
-        action_id = fallback.id
 
     return PolicyDecision(
         action_id=action_id,

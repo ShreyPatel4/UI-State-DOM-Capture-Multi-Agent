@@ -180,6 +180,48 @@ def test_validate_type_action_keeps_text():
     assert decision.text_to_type == "Hello"
 
 
+def test_invalid_action_id_returns_fallback():
+    candidates = [CandidateAction(id="btn_0", action_type="click", locator="loc", description="button")]
+    decision = _validate_and_normalize_decision(
+        obj={"action_id": "missing", "action_type": "click", "done": False},
+        candidates=candidates,
+        flow=None,
+        db_session=None,
+        step_index=1,
+    )
+    assert decision.action_id is None
+    assert decision.done is True
+    assert decision.notes == "fallback_invalid_action_id"
+
+
+def test_null_action_id_not_done_returns_fallback():
+    candidates = [CandidateAction(id="btn_0", action_type="click", locator="loc", description="button")]
+    decision = _validate_and_normalize_decision(
+        obj={"action_id": None, "action_type": "click", "done": False},
+        candidates=candidates,
+        flow=None,
+        db_session=None,
+        step_index=2,
+    )
+    assert decision.action_id is None
+    assert decision.done is True
+    assert decision.notes == "fallback_null_action_id_not_done"
+
+
+def test_type_missing_text_returns_fallback():
+    candidates = [CandidateAction(id="input_0", action_type="type", locator="loc", description="type title")]
+    decision = _validate_and_normalize_decision(
+        obj={"action_id": "input_0", "action_type": "type", "text_to_type": "   "},
+        candidates=candidates,
+        flow=None,
+        db_session=None,
+        step_index=3,
+    )
+    assert decision.action_id is None
+    assert decision.done is True
+    assert decision.notes == "fallback_type_missing_text"
+
+
 def test_llm_exception_falls_back():
     candidates = [CandidateAction(id="btn_0", action_type="click", locator="locator", description="button A")]
     llm = DummyLLM("", should_raise=True)
