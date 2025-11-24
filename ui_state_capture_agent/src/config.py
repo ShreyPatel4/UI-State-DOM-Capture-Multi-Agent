@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from dotenv import load_dotenv
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 load_dotenv()
 
 
 class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env")
+
     database_url: str = "postgresql+psycopg2://postgres:postgres@localhost:5432/uistate"
     minio_endpoint: str = "localhost:9000"
     minio_access_key: str | None = None
@@ -20,10 +22,6 @@ class Settings(BaseSettings):
     max_steps: int = 10
     dom_diff_threshold: float = 0.05
     max_action_failures: int = 2
-
-    class Config:
-        env_file = ".env"
-
 
 def get_settings() -> Settings:
     return Settings()

@@ -237,6 +237,7 @@ async def run_agent_loop(
                         failure_counts[_candidate_key(selected_candidate)] += 1
                         continue
                     typed_value = decision.text_to_type
+                    logged_value = typed_value if len(typed_value) <= 120 else typed_value[:117] + "..."
                     try:
                         await locator.click(timeout=2000)
                     except PlaywrightTimeoutError:
@@ -257,7 +258,11 @@ async def run_agent_loop(
                             session,
                             flow,
                             "info",
-                            f"typed text into action='{selected_candidate.description}' selector='{selected_candidate.locator}'",
+                            "typed value='{val}' into action='{desc}' selector='{loc}'".format(
+                                val=logged_value,
+                                desc=selected_candidate.description,
+                                loc=selected_candidate.locator,
+                            ),
                         )
                     except PlaywrightTimeoutError:
                         key = _candidate_key(selected_candidate)
@@ -274,7 +279,11 @@ async def run_agent_loop(
                                 session,
                                 flow,
                                 "info",
-                                f"typed text into action='{selected_candidate.description}' selector='{selected_candidate.locator}'",
+                                "typed value='{val}' into action='{desc}' selector='{loc}'".format(
+                                    val=logged_value,
+                                    desc=selected_candidate.description,
+                                    loc=selected_candidate.locator,
+                                ),
                             )
                         except PlaywrightTimeoutError:
                             if failure_counts[key] > max_action_failures:

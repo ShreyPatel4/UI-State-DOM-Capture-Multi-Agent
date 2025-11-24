@@ -55,7 +55,9 @@ class StructuredLLMClient:
         self.hf_pipeline = hf_pipeline
 
     def _generate(self, prompt: str) -> str:
-        return self.hf_pipeline(prompt, num_return_sequences=1)[0]["generated_text"]
+        return self.hf_pipeline(
+            prompt, num_return_sequences=1, return_full_text=False
+        )[0]["generated_text"]
 
     async def generate_text(self, prompt: str) -> str:
         return await asyncio.to_thread(self._generate, prompt)
@@ -80,8 +82,6 @@ def create_text_generation_pipeline(model_name: str | None = None, *, max_new_to
         device="cpu",
         max_new_tokens=max_new_tokens,
         do_sample=False,
-        temperature=0.0,
-        top_p=0.9,
     )
 
 

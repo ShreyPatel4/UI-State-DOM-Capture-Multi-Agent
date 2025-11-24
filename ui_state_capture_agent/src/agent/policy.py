@@ -17,9 +17,14 @@ class PolicyDecision:
     action_id: Optional[str]
     action_type: Literal["click", "type"]
     text_to_type: Optional[str]
-    capture: bool
-    done: bool
-    notes: str
+    capture: bool = True
+    done: bool = False
+    notes: str = ""
+    capture_before: bool = False
+    capture_after: bool = True
+    label: str = ""
+    reason: str = ""
+    should_capture: bool = True
 
 
 POLICY_SYSTEM_PROMPT = """
@@ -128,8 +133,6 @@ def create_policy_hf_pipeline(model_name: str | None = None) -> Any:
         device="cpu",
         max_new_tokens=128,
         do_sample=False,
-        temperature=0.0,
-        top_p=0.9,
     )
 
 
@@ -138,7 +141,9 @@ class PolicyLLMClient:
         self.hf_pipeline = hf_pipeline
 
     def generate(self, prompt: str) -> str:
-        return self.hf_pipeline(prompt, num_return_sequences=1)[0]["generated_text"]
+        return self.hf_pipeline(
+            prompt, num_return_sequences=1, return_full_text=False
+        )[0]["generated_text"]
 
     def complete(self, prompt: str) -> str:
         return self.generate(prompt)
@@ -228,21 +233,23 @@ def choose_action_with_llm(
     raw = llm.complete(prompt)
 
     if session and flow:
+        raw_excerpt = (raw or "")[:500].replace("\n", " ")
         log_flow_event(
             session,
             flow,
             "debug",
-            f"policy_raw_output step={step_index} text={(raw or '')[:500].replace('\n', ' ')}",
+            f"policy_raw_output step={step_index} text={raw_excerpt}",
         )
 
     parsed, reason = _extract_json(raw)
     if parsed is None:
         if session and flow:
+            raw_head = (raw or "")[:120].replace("\n", " ")
             log_flow_event(
                 session,
                 flow,
                 "warning",
-                f"policy_parse_failure step={step_index} reason={reason} head={(raw or '')[:120].replace('\n', ' ')}",
+                f"policy_parse_failure step={step_index} reason={reason} head={raw_head}",
             )
         return PolicyDecision(
             action_id=None,
@@ -290,6 +297,7 @@ class Policy:
         out = self.generator(
             prompt,
             num_return_sequences=1,
+            return_full_text=False,
         )[0]["generated_text"]
         return out
 
