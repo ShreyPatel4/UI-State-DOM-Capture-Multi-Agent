@@ -1,16 +1,24 @@
 import uuid
 
 from src.agent.dom_scanner import CandidateAction
-from src.agent.policy import PolicyDecision, _extract_json, choose_action_with_llm
+from src.agent.policy import (
+    PolicyDecision,
+    _extract_json,
+    _validate_and_normalize_decision,
+    choose_action_with_llm,
+)
 from src.agent.task_spec import TaskSpec
 from src.models import FlowLog
 
 
 class DummyLLM:
-    def __init__(self, output: str):
+    def __init__(self, output: str, should_raise: bool = False):
         self.output = output
+        self.should_raise = should_raise
 
-    def complete(self, prompt: str) -> str:  # noqa: ARG002
+    def generate_text(self, prompt: str) -> str:  # noqa: ARG002
+        if self.should_raise:
+            raise RuntimeError("boom")
         return self.output
 
 
@@ -39,6 +47,8 @@ def test_extract_json_variants():
     assert _extract_json(fenced)[0] == {"a": 2}
     noisy = "Here is the result: {\"a\":3} and some trailing text"
     assert _extract_json(noisy)[0] == {"a": 3}
+    empty, reason = _extract_json("")
+    assert empty is None and reason == "empty_output"
 
 
 def test_choose_action_valid_json():
@@ -139,3 +149,50 @@ def test_choose_action_invalid_json_sets_text_none():
     )
 
     assert decision.text_to_type is None
+
+
+def test_validate_alias_id_preserved():
+    candidates = [
+        CandidateAction(id="btn_0", action_type="click", locator="loc", description="button"),
+        CandidateAction(id="btn_2", action_type="click", locator="loc2", description="create"),
+    ]
+    decision = _validate_and_normalize_decision(
+        obj={"id": "btn_2", "action_type": "click"},
+        candidates=candidates,
+        flow=None,
+        db_session=None,
+        step_index=1,
+    )
+    assert decision.action_id == "btn_2"
+    assert decision.action_type == "click"
+
+
+def test_validate_type_action_keeps_text():
+    candidates = [CandidateAction(id="input_0", action_type="type", locator="loc", description="type title")]
+    decision = _validate_and_normalize_decision(
+        obj={"action_id": "input_0", "action_type": "type", "text_to_type": "Hello"},
+        candidates=candidates,
+        flow=None,
+        db_session=None,
+        step_index=1,
+    )
+    assert decision.action_type == "type"
+    assert decision.text_to_type == "Hello"
+
+
+def test_llm_exception_falls_back():
+    candidates = [CandidateAction(id="btn_0", action_type="click", locator="locator", description="button A")]
+    llm = DummyLLM("", should_raise=True)
+    task = TaskSpec(original_query="", app_name="linear", goal="go", start_url="http://example.com")
+
+    decision = choose_action_with_llm(
+        llm,
+        task,
+        task.app_name,
+        "http://example.com",
+        "",
+        candidates,
+    )
+
+    assert decision.action_id is None
+    assert decision.done is True

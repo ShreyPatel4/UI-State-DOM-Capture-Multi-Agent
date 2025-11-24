@@ -39,7 +39,12 @@
                     <td>{{ flow.task_title }}</td>
                     <td>{{ flow.task_blurb }}</td>
                     <td>{{ flow.run_id }}</td>
-                    <td><span class="status status-{{ flow.status | lower }}">{{ flow.status }}</span></td>
+                    <td>
+                        <span class="status status-{{ flow.status | lower }}">{{ flow.status }}</span>
+                        {% if flow.status == "running" %}
+                        <span class="pill pill-live">live</span>
+                        {% endif %}
+                    </td>
                     <td>{{ flow.started_at }}</td>
                     <td>{{ flow.finished_at or "-" }}</td>
                     <td><a class="link" href="{{ url_for('flow_detail', flow_id=flow.id) }}">View</a></td>

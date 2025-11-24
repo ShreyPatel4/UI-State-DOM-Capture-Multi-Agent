@@ -70,6 +70,31 @@ class StructuredLLMClient:
         return data
 
 
+class PolicyLLMClient:
+    def __init__(self, hf_pipeline: Any) -> None:
+        self.pipeline = hf_pipeline
+
+    def generate_text(self, prompt: str) -> str:
+        try:
+            out = self.pipeline(
+                prompt,
+                max_new_tokens=128,
+                do_sample=False,
+                return_full_text=False,
+            )
+        except Exception:
+            raise
+
+        if isinstance(out, list) and out:
+            item = out[0]
+            if isinstance(item, dict) and "generated_text" in item:
+                return item["generated_text"].strip()
+            if isinstance(item, str):
+                return item.strip()
+
+        return str(out).strip()
+
+
 def create_text_generation_pipeline(model_name: str | None = None, *, max_new_tokens: int = 512) -> Any:
     model_name = model_name or settings.hf_model_name
     tokenizer = AutoTokenizer.from_pretrained(model_name)

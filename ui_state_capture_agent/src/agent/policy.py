@@ -9,6 +9,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
 from ..config import settings
 from ..models import Flow, log_flow_event
 from .dom_scanner import CandidateAction
+from .llm_client import PolicyLLMClient
 from .task_spec import TaskSpec
 
 
@@ -29,7 +30,7 @@ class PolicyDecision:
 
 POLICY_SYSTEM_PROMPT = """
 You are a deterministic UI policy that selects exactly one action for the next step.
-Return exactly one JSON object and nothing else. No natural language. No markdown. No code fences.
+Return exactly one JSON object and nothing else. No prose. No lead-in sentences. No markdown. No code fences.
 
 JSON schema:
 {
@@ -38,7 +39,7 @@ JSON schema:
   "text_to_type": "<text to type>" or null,
   "capture": true or false,
   "done": true or false,
-  "notes": "<short free text or empty string>"
+  "notes": "<short explanation or empty string>"
 }
 """
 
@@ -62,10 +63,10 @@ def build_policy_prompt(
     lines.append("History summary:")
     lines.append(history_summary if history_summary else "(no previous actions)")
     lines.append("")
-    lines.append("Candidate actions (choose one id):")
+    lines.append("Candidate actions (choose one id for action_id):")
     for cand in candidates:
         lines.append(
-            f"  - id={cand.id} type={cand.action_type} description={cand.description}"
+            f"  - action_id={cand.id} type={cand.action_type} description={cand.description}"
         )
     lines.append("")
     lines.append(
@@ -74,42 +75,49 @@ def build_policy_prompt(
     return "\n".join(lines)
 
 
-def _extract_json(text: str) -> tuple[dict | None, str | None]:
+def _extract_json(raw_text: str) -> tuple[dict | None, str | None]:
     """Robustly extract a JSON object from LLM chatter without raising."""
 
-    if text is None or not str(text).strip():
+    if raw_text is None or not str(raw_text).strip():
         return None, "empty_output"
 
-    cleaned = str(text).strip()
+    cleaned = str(raw_text).strip()
+    decode_error = ""
 
     fence_pattern = re.compile(r"^```(?:json)?\s*(.*?)\s*```$", re.DOTALL | re.IGNORECASE)
-    match = fence_pattern.match(cleaned)
-    if match:
-        cleaned = match.group(1).strip()
+    fence_match = fence_pattern.match(cleaned)
+    if fence_match:
+        cleaned = fence_match.group(1).strip()
 
     try:
         obj = json.loads(cleaned)
         if isinstance(obj, dict):
             return obj, None
         return None, "json_not_object"
-    except json.JSONDecodeError:
-        pass
+    except json.JSONDecodeError as exc:  # noqa: BLE001
+        decode_error = exc.msg
+    else:
+        return None, "json_not_object"
 
     last_open = cleaned.rfind("{")
     last_close = cleaned.rfind("}")
     if last_open < 0 or last_close < 0 or last_close < last_open:
         return None, "no_brace_block_found"
 
-    snippet = cleaned[last_open : last_close + 1]
+    candidate = cleaned[last_open : last_close + 1].strip()
+    candidate_match = fence_pattern.match(candidate)
+    if candidate_match:
+        candidate = candidate_match.group(1).strip()
+
     try:
-        obj = json.loads(snippet)
+        obj = json.loads(candidate)
         if isinstance(obj, dict):
             return obj, None
         return None, "json_not_object"
     except json.JSONDecodeError as exc:  # noqa: BLE001
         return None, f"json_decode_error:{exc.msg}"
     except Exception:
-        return None, "json_parse_exception"
+        return None, f"json_decode_error:{decode_error}"
 
 
 def choose_fallback_action(goal: str, candidates: Sequence[CandidateAction]) -> CandidateAction:
@@ -136,53 +144,47 @@ def create_policy_hf_pipeline(model_name: str | None = None) -> Any:
     )
 
 
-class PolicyLLMClient:
-    def __init__(self, hf_pipeline: Any) -> None:
-        self.hf_pipeline = hf_pipeline
-
-    def generate(self, prompt: str) -> str:
-        return self.hf_pipeline(
-            prompt, num_return_sequences=1, return_full_text=False
-        )[0]["generated_text"]
-
-    def complete(self, prompt: str) -> str:
-        return self.generate(prompt)
-
-
 def _validate_and_normalize_decision(
-    data: dict,
-    candidates: Sequence[CandidateAction],
     *,
-    session: Session | None = None,
-    flow: Flow | None = None,
-    step_index: int | None = None,
+    obj,
+    candidates: Sequence[CandidateAction],
+    flow: Flow | None,
+    db_session: Session | None,
+    step_index: int | None,
 ) -> PolicyDecision:
     candidate_ids = {c.id for c in candidates}
     type_candidates = [c for c in candidates if c.action_type == "type"]
-    type_candidate_ids = {c.id for c in type_candidates}
+    type_ids = {c.id for c in type_candidates}
 
-    action_id = data.get("action_id")
-    action_type = (data.get("action_type") or "click").lower()
-    text_to_type = data.get("text_to_type")
-    capture = bool(data.get("capture", True))
-    done = bool(data.get("done", False))
-    notes = str(data.get("notes") or "").strip()
+    action_id = obj.get("action_id")
+    if action_id is None and "id" in obj:
+        action_id = obj.get("id")
+
+    action_type = (obj.get("action_type") or "click").lower()
+    text_to_type = obj.get("text_to_type")
+    capture = bool(obj.get("capture", True))
+    done = bool(obj.get("done", False))
+    notes = obj.get("notes") or ""
 
     def log(level: str, message: str) -> None:
-        if session and flow:
+        if db_session and flow:
             log_flow_event(
-                session,
+                db_session,
                 flow,
                 level,
                 f"{message} step={step_index if step_index is not None else '?'}",
             )
 
     if action_id is not None and action_id not in candidate_ids:
-        log("warning", f"policy_invalid_action_id id={action_id}")
+        log("warning", f"policy_invalid_action_id step={step_index} action_id={action_id}")
         action_id = None
 
+    if action_type not in ("click", "type"):
+        log("warning", f"policy_invalid_action_type step={step_index} type={action_type}")
+        action_type = "click"
+
     if action_type == "type":
-        if not (isinstance(text_to_type, str) and text_to_type.strip()):
+        if not text_to_type or str(text_to_type).strip() == "":
             log("warning", "policy_type_without_text")
             action_type = "click"
             text_to_type = None
@@ -194,27 +196,27 @@ def _validate_and_normalize_decision(
                 text_to_type=None,
                 capture=True,
                 done=True,
-                notes="fallback: no type candidates",
+                notes="fallback_due_to_type_without_candidates",
             )
-        elif action_id is not None and action_id not in type_candidate_ids:
+        elif action_id is not None and action_id not in type_ids:
             log("warning", "policy_type_action_on_non_type_candidate")
-            action_id = type_candidates[0].id
-    elif action_type != "click":
-        log("warning", f"policy_invalid_action_type type={action_type}")
-        action_type = "click"
-        text_to_type = None
+            action_id = next(iter(type_ids))
 
     if action_id is None and not done and candidates:
-        action_id = candidates[0].id
-        log("info", f"policy_missing_action_id_using_first_candidate id={action_id}")
+        fallback = candidates[0]
+        log(
+            "info",
+            f"policy_missing_action_id_using_first_candidate id={fallback.id}",
+        )
+        action_id = fallback.id
 
     return PolicyDecision(
         action_id=action_id,
-        action_type=action_type if action_type in {"click", "type"} else "click",
+        action_type=action_type,
         text_to_type=text_to_type if isinstance(text_to_type, str) else None,
         capture=capture,
         done=done,
-        notes=notes,
+        notes=str(notes),
     )
 
 
@@ -230,7 +232,24 @@ def choose_action_with_llm(
     step_index: int | None = None,
 ) -> PolicyDecision:
     prompt = build_policy_prompt(task, app_name, url, history_summary, candidates)
-    raw = llm.complete(prompt)
+    try:
+        raw = llm.generate_text(prompt)
+    except Exception as exc:  # noqa: BLE001
+        if session and flow:
+            log_flow_event(
+                session,
+                flow,
+                "error",
+                f"policy_llm_exception step={step_index} msg={repr(exc)}",
+            )
+        return PolicyDecision(
+            action_id=None,
+            action_type="click",
+            text_to_type=None,
+            capture=True,
+            done=True,
+            notes=f"fallback_due_to_llm_exception:{exc}",
+        )
 
     if session and flow:
         raw_excerpt = (raw or "")[:500].replace("\n", " ")
@@ -261,10 +280,10 @@ def choose_action_with_llm(
         )
 
     decision = _validate_and_normalize_decision(
-        parsed,
-        candidates,
-        session=session,
+        obj=parsed,
+        candidates=candidates,
         flow=flow,
+        db_session=session,
         step_index=step_index,
     )
 
@@ -328,4 +347,10 @@ class Policy:
                 notes=f"fallback_due_to_parse_failure:{reason}",
             )
 
-        return _validate_and_normalize_decision(parsed, candidates)
+        return _validate_and_normalize_decision(
+            obj=parsed,
+            candidates=candidates,
+            flow=None,
+            db_session=None,
+            step_index=None,
+        )

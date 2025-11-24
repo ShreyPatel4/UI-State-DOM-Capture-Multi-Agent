@@ -58,6 +58,23 @@ class StepSummary(BaseModel):
     url: str | None
     url_changed: bool | None
     state_kind: str | None
+    screenshot_url: str | None = None
+
+
+class FlowStatusResponse(BaseModel):
+    id: str
+    status: str
+    status_reason: str | None
+    started_at: datetime
+    finished_at: datetime | None
+    step_count: int
+    log_count: int
+
+
+class FlowLogEntry(BaseModel):
+    timestamp: datetime
+    level: str
+    message: str
 
 
 @app.post("/agent/run", response_model=RunTaskResponse)
@@ -123,6 +140,26 @@ def list_flows_json(db=Depends(get_db)):
     ]
 
 
+@app.get("/api/flows/{flow_id}/status", response_model=FlowStatusResponse)
+def get_flow_status_summary(flow_id: str, db: Session = Depends(get_db)):
+    flow = db.query(Flow).get(flow_id)
+    if not flow:
+        raise HTTPException(status_code=404, detail="Flow not found")
+
+    step_count = db.query(Step).filter(Step.flow_id == flow_id).count()
+    log_count = db.query(FlowLog).filter(FlowLog.flow_id == flow_id).count()
+
+    return FlowStatusResponse(
+        id=str(flow.id),
+        status=flow.status,
+        status_reason=flow.status_reason,
+        started_at=flow.started_at,
+        finished_at=flow.finished_at,
+        step_count=step_count,
+        log_count=log_count,
+    )
+
+
 @app.get("/api/flows/{flow_id}/steps", response_model=List[StepSummary])
 def list_flow_steps(flow_id: str, db=Depends(get_db)):
     flow = db.query(Flow).get(flow_id)
@@ -142,8 +179,27 @@ def list_flow_steps(flow_id: str, db=Depends(get_db)):
             url=s.url,
             url_changed=s.url_changed,
             state_kind=s.state_kind,
+            screenshot_url=f"/assets/{flow_id}/{s.step_index}/screenshot",
         )
         for s in steps
+    ]
+
+
+@app.get("/api/flows/{flow_id}/logs", response_model=List[FlowLogEntry])
+def list_flow_logs(flow_id: str, db=Depends(get_db)):
+    flow = db.query(Flow).get(flow_id)
+    if not flow:
+        raise HTTPException(status_code=404, detail="Flow not found")
+
+    logs = (
+        db.query(FlowLog)
+        .filter(FlowLog.flow_id == flow_id)
+        .order_by(FlowLog.created_at.asc())
+        .all()
+    )
+    return [
+        FlowLogEntry(timestamp=log.created_at, level=log.level, message=log.message)
+        for log in logs
     ]
 
 

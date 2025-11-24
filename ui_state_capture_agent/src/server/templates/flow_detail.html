@@ -58,6 +58,42 @@
 </section>
 {% if flow.status == "running" %}
 <script>
+    const flowId = "{{ flow.id }}";
+    let lastStepCount = {{ steps|length }};
+    let lastLogCount = 0;
+
+    async function fetchLogCount() {
+        try {
+            const res = await fetch(`/api/flows/${flowId}/status`);
+            if (!res.ok) return null;
+            const data = await res.json();
+            lastLogCount = data.log_count;
+        } catch (error) {
+            console.error("Failed to fetch initial counts", error);
+        }
+    }
+
+    fetchLogCount();
+
+    const intervalMs = 1500;
+
+    async function pollFlow() {
+        try {
+            const res = await fetch(`/api/flows/${flowId}/status`);
+            if (!res.ok) return;
+            const data = await res.json();
+            if (data.status === "running" && (data.step_count !== lastStepCount || data.log_count !== lastLogCount)) {
+                window.location.reload();
+            }
+        } catch (error) {
+            console.error("pollFlow error", error);
+        }
+    }
+
+    if ("{{ flow.status }}" === "running") {
+        setInterval(pollFlow, intervalMs);
+    }
+
     const cancelButton = document.getElementById("cancel-run");
     if (cancelButton) {
         cancelButton.addEventListener("click", async () => {
