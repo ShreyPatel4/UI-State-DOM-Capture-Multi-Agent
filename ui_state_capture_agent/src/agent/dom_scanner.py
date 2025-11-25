@@ -687,24 +687,78 @@ async def scan_candidate_actions(
         type_locator = page.locator(type_selector)
         type_count = await type_locator.count()
         type_index = start_index
+        logging.debug(
+            "type_scan step=%s selector=%s count=%s",
+            step_index,
+            type_selector,
+            type_count,
+        )
         for i in range(type_count):
             if len(candidates) >= max_actions:
+                logging.debug(
+                    "type_scan abort: max_actions reached step=%s len=%s",
+                    step_index,
+                    len(candidates),
+                )
                 return
             handle = type_locator.nth(i)
-            if not await is_visible(handle):
+            try:
+                visible = await handle.is_visible()
+            except Exception as exc:
+                logging.debug("type_scan[%s]: is_visible error=%r", i, exc)
+                visible = False
+
+            try:
+                attrs = await handle.evaluate(
+                    """(el) => ({
+            tag: el.tagName && el.tagName.toLowerCase(),
+            role: el.getAttribute('role'),
+            ce: el.getAttribute('contenteditable'),
+            type: el.getAttribute('type'),
+            classes: el.className,
+            text: el.innerText
+        })"""
+                )
+            except Exception as exc:
+                logging.debug("type_scan[%s]: attr eval error=%r", i, exc)
+                attrs = {}
+
+            logging.debug(
+                "type_scan[%s]: visible=%s attrs=%s",
+                i,
+                visible,
+                attrs,
+            )
+
+            if not visible:
+                logging.debug("type_scan[%s]: skip_not_visible", i)
                 continue
 
             element_uid, candidate = await make_type_candidate_from_locator(handle, i, type_index)
             if not candidate:
+                logging.debug("type_scan[%s]: make_type_candidate returned None", i)
                 continue
 
             if element_uid and element_uid in seen_elements:
+                logging.debug("type_scan[%s]: skip_seen uid=%s", i, element_uid)
                 continue
 
             add_candidate(candidate)
             if element_uid:
                 seen_elements.add(element_uid)
+            logging.debug(
+                "type_scan[%s]: added_type_candidate id=%s desc=%s",
+                i,
+                candidate.id,
+                candidate.description,
+            )
             type_index += 1
+
+        logging.debug(
+            "type_scan done step=%s total_type_candidates=%s",
+            step_index,
+            len([c for c in candidates if c.is_type_target]),
+        )
 
     for cand in snapshot_text_candidates:
         add_candidate(cand)
