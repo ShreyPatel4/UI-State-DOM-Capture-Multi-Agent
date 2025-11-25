@@ -210,6 +210,20 @@ async def run_agent_loop(
                     f"id={cand.id} kind={kind} text=\"{text_preview}\" score={cand.goal_match_score:.2f}"
                 )
             summary_text = "; ".join(summaries)
+            type_candidates = sorted(
+                [c for c in candidates if getattr(c, "is_type_target", False)],
+                key=lambda c: c.goal_match_score,
+                reverse=True,
+            )[:2]
+            type_summaries = []
+            for cand in type_candidates:
+                text_preview = cand.visible_text or cand.description
+                if len(text_preview) > 80:
+                    text_preview = text_preview[:77] + "..."
+                type_summaries.append(
+                    f"id={cand.id} text=\"{text_preview}\" score={cand.goal_match_score:.2f}"
+                )
+            type_summary_text = "; ".join(type_summaries)
             if active_snapshot:
                 log_flow_event(
                     session,
@@ -225,11 +239,12 @@ async def run_agent_loop(
                 session,
                 flow,
                 "info",
-                "policy_call step={step} url={url} candidates={count} type_ids={types} top=[{summary}]".format(
+                "policy_call step={step} url={url} candidates={count} type_ids={types} type_top=[{type_summary}] top=[{summary}]".format(
                     step=step_index,
                     url=current_url,
                     count=len(candidates),
                     types=type_ids[:5],
+                    type_summary=type_summary_text,
                     summary=summary_text,
                 ),
             )

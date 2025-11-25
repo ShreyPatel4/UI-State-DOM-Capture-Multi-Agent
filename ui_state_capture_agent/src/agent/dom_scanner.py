@@ -34,6 +34,7 @@ class CandidateAction:
     is_primary_cta: bool = False
     is_nav_link: bool = False
     is_form_field: bool = False
+    is_type_target: bool = False
     goal_match_score: float = 0.0
     source_hint: Optional[str] = None
 
@@ -169,6 +170,7 @@ def _scan_text_candidates_from_snapshot(
                 visible_text=visible_text,
                 placeholder=None,
                 is_form_field=True,
+                is_type_target=True,
                 goal_match_score=goal_match_score,
                 semantics={"ax"},
                 aria_label=ax.name,
@@ -194,6 +196,7 @@ def _scan_text_candidates_from_snapshot(
                 visible_text=label or node.node_name,
                 placeholder=node.attributes.get("placeholder"),
                 is_form_field=True,
+                is_type_target=True,
                 goal_match_score=goal_match_score,
                 semantics={"dom_snapshot"},
                 source_hint="dom_snapshot",
@@ -553,36 +556,21 @@ async def scan_candidate_actions(
             )
         )
 
-    # Discover text entry elements.
-    if snapshot_text_candidates:
-        for cand in snapshot_text_candidates:
-            add_candidate(cand)
-        type_ids = [c.id for c in candidates if c.is_form_field or c.action_type == "type"]
-        return candidates, type_ids
-
     type_selector = "input, textarea, [contenteditable='true'], [role='textbox']"
-    type_locator = page.locator(type_selector)
-    type_count = await type_locator.count()
-    type_index = 0
     allowed_input_types = {"text", "search", "email", "url", "number", "password"}
-    for i in range(type_count):
-        if len(candidates) >= max_actions:
-            return candidates, [c.id for c in candidates if c.is_form_field or c.action_type == "type"]
-        handle = type_locator.nth(i)
-        if not await is_visible(handle):
-            continue
 
+    async def make_type_candidate_from_locator(handle, nth_index: int, type_index: int) -> tuple[Optional[str], Optional[CandidateAction]]:
         tag_name = (await handle.evaluate("(el) => el.tagName.toLowerCase()")) or ""
         contenteditable_attr = await handle.get_attribute("contenteditable")
+        role = (await handle.get_attribute("role")) or None
         input_type = (await handle.get_attribute("type")) or None
         if tag_name == "input":
             input_type = (input_type or "text").lower()
             if input_type not in allowed_input_types:
-                continue
+                return None, None
 
-        role = (await handle.get_attribute("role")) or None
         if tag_name not in {"input", "textarea"} and not contenteditable_attr and (role or "").lower() != "textbox":
-            continue
+            return None, None
 
         aria_label_raw = trim_text(await handle.get_attribute("aria-label"), limit=120)
         placeholder_value = trim_text(await handle.get_attribute("placeholder"), limit=120)
@@ -635,12 +623,10 @@ async def scan_candidate_actions(
         )
         is_form_field = True
         goal_match_score = compute_goal_score(f"{visible_text} {ancestor_text}")
+        if goal_has_concrete_name and _has_text_field_keyword(primary_hint or visible_text):
+            goal_match_score += 1.0
 
         element_uid = await get_element_uid(handle)
-        if element_uid and element_uid in seen_elements:
-            continue
-        if element_uid:
-            seen_elements.add(element_uid)
 
         if tag_name == "textarea":
             base_desc = "multiline text area"
@@ -652,34 +638,71 @@ async def scan_candidate_actions(
             base_desc = "text entry"
 
         desc_hint = primary_hint or placeholder_value or text_content
-        description = (
-            f"{base_desc} \"{desc_hint}\"" if desc_hint else base_desc
-        )
-        add_candidate(
-            CandidateAction(
-                id=f"input_{type_index}",
-                locator=f"{type_selector} >> nth={i}",
-                action_type="type",
-                description=description,
-                tag=tag_name,
-                role=role,
-                aria_label=aria_label,
-                type=input_type,
-                text=primary_hint or text_content,
-                semantics=semantics,
-                bounding_box=bbox,
-                kind="type",
-                visible_text=visible_text,
-                placeholder=placeholder_value,
-                ancestor_text=ancestor_text,
-                section_label=section_label,
-                is_primary_cta=is_primary_cta,
-                is_nav_link=is_nav_link,
-                is_form_field=is_form_field,
-                goal_match_score=goal_match_score,
-            )
-        )
-        type_index += 1
+        description = f"{base_desc} \"{desc_hint}\"" if desc_hint else base_desc
 
-    type_ids = [c.id for c in candidates if c.is_form_field or c.action_type == "type"]
+        candidate = CandidateAction(
+            id=f"input_{type_index}",
+            locator=f"{type_selector} >> nth={nth_index}",
+            action_type="type",
+            description=description,
+            tag=tag_name,
+            role=role,
+            aria_label=aria_label,
+            type=input_type,
+            text=primary_hint or text_content,
+            semantics=semantics,
+            bounding_box=bbox,
+            kind="type",
+            visible_text=visible_text,
+            placeholder=placeholder_value,
+            ancestor_text=ancestor_text,
+            section_label=section_label,
+            is_primary_cta=is_primary_cta,
+            is_nav_link=is_nav_link,
+            is_form_field=is_form_field,
+            is_type_target=True,
+            goal_match_score=goal_match_score,
+            source_hint="playwright_scan",
+        )
+        return element_uid, candidate
+
+    def next_type_index() -> int:
+        max_index = -1
+        for cid in candidate_ids:
+            if cid.startswith("input_"):
+                try:
+                    max_index = max(max_index, int(cid.split("_", 1)[1]))
+                except ValueError:
+                    continue
+        return max_index + 1
+
+    async def augment_with_type_candidates_from_playwright(start_index: int) -> None:
+        type_locator = page.locator(type_selector)
+        type_count = await type_locator.count()
+        type_index = start_index
+        for i in range(type_count):
+            if len(candidates) >= max_actions:
+                return
+            handle = type_locator.nth(i)
+            if not await is_visible(handle):
+                continue
+
+            element_uid, candidate = await make_type_candidate_from_locator(handle, i, type_index)
+            if not candidate:
+                continue
+
+            if element_uid and element_uid in seen_elements:
+                continue
+
+            add_candidate(candidate)
+            if element_uid:
+                seen_elements.add(element_uid)
+            type_index += 1
+
+    for cand in snapshot_text_candidates:
+        add_candidate(cand)
+
+    await augment_with_type_candidates_from_playwright(next_type_index())
+
+    type_ids = [c.id for c in candidates if c.is_type_target]
     return candidates, type_ids
