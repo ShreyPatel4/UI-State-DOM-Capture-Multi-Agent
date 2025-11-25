@@ -2,6 +2,7 @@ from __future__ import annotations
 """Generic DOM scanner for interactive elements (no app-specific selectors)."""
 
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import List, Literal, Optional, Set, Tuple
 
@@ -55,6 +56,19 @@ def _prepare_goal_tokens(goal: Optional[str]) -> Set[str]:
             if len(cleaned) >= 3:
                 goal_tokens.add(cleaned)
     return goal_tokens
+
+
+def _goal_contains_concrete_name(goal: Optional[str]) -> bool:
+    if not goal:
+        return False
+    if re.search(r"[\"']([^\"']{2,})[\"']", goal):
+        return True
+    return bool(re.search(r"(named|called|titled|title|name|subject)\s+([\w\-]{3,})", goal, re.IGNORECASE))
+
+
+def _has_text_field_keyword(text: str) -> bool:
+    lowered = text.lower()
+    return any(keyword in lowered for keyword in ["title", "name", "subject", "summary", "heading"])
 
 
 def _compute_goal_score(candidate_text: str, goal_tokens: Set[str]) -> float:
@@ -123,10 +137,14 @@ def _is_dom_text_input(node: SnapshotNode) -> bool:
         return True
     if node.attributes.get("contenteditable", "").lower() == "true":
         return True
+    if node.attributes.get("role", "").lower() == "textbox":
+        return True
     return False
 
 
-def _scan_text_candidates_from_snapshot(snapshot: PageSnapshot, goal_tokens: Set[str]) -> List[CandidateAction]:
+def _scan_text_candidates_from_snapshot(
+    snapshot: PageSnapshot, goal_tokens: Set[str], goal_has_concrete_name: bool
+) -> List[CandidateAction]:
     candidates: List[CandidateAction] = []
     text_roles = {"textbox", "searchbox", "combobox"}
 
@@ -139,6 +157,8 @@ def _scan_text_candidates_from_snapshot(snapshot: PageSnapshot, goal_tokens: Set
         locator = f"text={label}" if label else "css=input,textarea"
         visible_text = label or role or "input"
         goal_match_score = _compute_goal_score(visible_text, goal_tokens)
+        if goal_has_concrete_name and _has_text_field_keyword(label):
+            goal_match_score += 1.0
         candidates.append(
             CandidateAction(
                 id=f"ax_input_{i}",
@@ -162,6 +182,8 @@ def _scan_text_candidates_from_snapshot(snapshot: PageSnapshot, goal_tokens: Set
         label = label.strip()
         locator = f"text={label}" if label else "css=input,textarea"
         goal_match_score = _compute_goal_score(label or node.node_name, goal_tokens)
+        if goal_has_concrete_name and _has_text_field_keyword(label):
+            goal_match_score += 1.0
         candidates.append(
             CandidateAction(
                 id=f"dom_input_{j}",
@@ -198,6 +220,7 @@ async def scan_candidate_actions(
     candidates: List[CandidateAction] = []
     candidate_ids: Set[str] = set()
     goal_tokens: Set[str] = _prepare_goal_tokens(goal)
+    goal_has_concrete_name = _goal_contains_concrete_name(goal)
 
     def add_candidate(cand: CandidateAction) -> None:
         if cand.id in candidate_ids or len(candidates) >= max_actions:
@@ -430,7 +453,9 @@ async def scan_candidate_actions(
     snapshot_text_candidates: List[CandidateAction] = []
     if snapshot:
         snapshot_click_candidates = _scan_click_candidates_from_snapshot(snapshot, goal_tokens)
-        snapshot_text_candidates = _scan_text_candidates_from_snapshot(snapshot, goal_tokens)
+        snapshot_text_candidates = _scan_text_candidates_from_snapshot(
+            snapshot, goal_tokens, goal_has_concrete_name
+        )
         if snapshot_text_candidates:
             examples = [
                 {

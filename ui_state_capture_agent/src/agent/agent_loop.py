@@ -240,6 +240,7 @@ async def run_agent_loop(
                 current_url,
                 history_summary,
                 candidates,
+                type_ids=type_ids,
                 session=session,
                 flow=flow,
                 step_index=step_index,

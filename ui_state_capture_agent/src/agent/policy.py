@@ -45,6 +45,7 @@ Schema (all fields are required):
 
 Rules:
 - action_id MUST be either one of the candidate ids from the list OR null.
+- Choose action_type "type" ONLY when the provided action_id is present in type_ids.
 - If action_type == "type", you MUST set text_to_type to a non empty string derived from the goal.
 - If done == true, action_id MUST be null.
 - If action_id is null and done == false, that means "no suitable action" and the controller will stop.
@@ -69,7 +70,11 @@ def build_policy_prompt(
     url: str,
     history_summary: str,
     candidates: Sequence[CandidateAction],
+    type_ids: Sequence[str] | None = None,
 ) -> str:
+    type_ids = list(type_ids) if type_ids is not None else [
+        c.id for c in candidates if c.is_form_field or c.action_type == "type"
+    ]
     def fmt(c: CandidateAction) -> str:
         kind = (
             "primary_cta"
@@ -98,6 +103,12 @@ def build_policy_prompt(
     lines.append("")
     lines.append(f"App/context name (do not assume behaviors): {app_name}")
     lines.append(f"Current page URL: {url}")
+    lines.append("")
+    lines.append(
+        "Valid type targets (type_ids): {ids}. Use action_type='type' ONLY when action_id is in this list. "
+        "If type_ids is empty, choose a click or action_id null instead."
+        .format(ids=type_ids if type_ids else [])
+    )
     lines.append("")
     lines.append("History summary:")
     lines.append(history_summary if history_summary else "(no previous actions)")
@@ -170,6 +181,25 @@ def choose_fallback_action(goal: str, candidates: Sequence[CandidateAction]) -> 
         return len(g & d)
 
     return max(candidates, key=score)
+
+
+def _best_click_candidate(candidates: Sequence[CandidateAction]) -> CandidateAction | None:
+    click_candidates = [
+        cand
+        for cand in candidates
+        if (cand.action_type == "click") or ((cand.kind or "").lower() == "click")
+    ]
+    if not click_candidates:
+        return None
+
+    def score(cand: CandidateAction) -> tuple[float, int, int]:
+        return (
+            float(cand.goal_match_score or 0.0),
+            1 if cand.is_primary_cta else 0,
+            0 if cand.is_nav_link else 1,
+        )
+
+    return sorted(click_candidates, key=score, reverse=True)[0]
 
 
 def create_policy_hf_pipeline(model_name: str | None = None) -> Any:
@@ -268,8 +298,8 @@ def _validate_and_normalize_decision(
             candidate
             and (
                 candidate.is_form_field
-                or (candidate.kind or "").lower() == "type"
-                or candidate.action_type == "type"
+                or ((candidate.kind or "").lower() == "type" and candidate.is_form_field)
+                or (candidate.action_type == "type" and candidate.is_form_field)
             )
         )
         if candidate is None or not supports_type:
@@ -278,6 +308,16 @@ def _validate_and_normalize_decision(
                 "warning",
                 f"policy_invalid_type_target step={step_index} reason={reason} id={action_id}",
             )
+            fallback_click = _best_click_candidate(candidates)
+            if fallback_click:
+                return PolicyDecision(
+                    action_id=fallback_click.id,
+                    action_type="click",
+                    text_to_type=None,
+                    capture=True,
+                    done=False,
+                    notes="Fallback click after invalid type target",
+                )
             return PolicyDecision(
                 action_id=None,
                 action_type="click",
@@ -304,11 +344,12 @@ def choose_action_with_llm(
     url: str,
     history_summary: str,
     candidates: Sequence[CandidateAction],
+    type_ids: Sequence[str] | None = None,
     session: Session | None = None,
     flow: Flow | None = None,
     step_index: int | None = None,
 ) -> PolicyDecision:
-    prompt = build_policy_prompt(task, app_name, url, history_summary, candidates)
+    prompt = build_policy_prompt(task, app_name, url, history_summary, candidates, type_ids)
     try:
         raw = llm.generate_text(prompt)
     except Exception as exc:  # noqa: BLE001
@@ -403,6 +444,7 @@ class Policy:
         candidates: Sequence[CandidateAction],
         history_summary: str,
         url: str,
+        type_ids: Sequence[str] | None = None,
     ) -> PolicyDecision:
         prompt = build_policy_prompt(
             task=task,
@@ -410,6 +452,7 @@ class Policy:
             url=url,
             history_summary=history_summary,
             candidates=candidates,
+            type_ids=type_ids,
         )
         raw = self._run_hf(prompt)
         parsed, reason = _extract_json(raw)

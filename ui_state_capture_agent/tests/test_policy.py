@@ -195,12 +195,15 @@ def test_build_policy_prompt_highlights_form_fields():
         start_url="http://example.com",
     )
 
-    prompt = build_policy_prompt(task, task.app_name, task.start_url, "", candidates)
+    type_ids = [c.id for c in candidates if c.is_form_field or c.action_type == "type"]
+    prompt = build_policy_prompt(task, task.app_name, task.start_url, "", candidates, type_ids)
 
     assert "form_field" in prompt
     assert "action_type='type'" in prompt
     assert "title" in prompt.lower()
     assert "goal_match_score=2.00" in prompt
+    assert str(type_ids[0]) in prompt
+    assert "ONLY when action_id is in this list" in prompt
 
 
 def test_validate_alias_id_preserved():
@@ -282,6 +285,29 @@ def test_type_missing_text_returns_fallback():
     assert decision.notes == "fallback_type_missing_text"
 
 
+def test_invalid_type_target_without_click_candidates_stops_flow():
+    candidates = [
+        CandidateAction(
+            id="input_0",
+            action_type="type",
+            locator="loc",
+            description="type field",
+            is_form_field=False,
+        )
+    ]
+    decision = _validate_and_normalize_decision(
+        obj={"action_id": "input_0", "action_type": "type", "text_to_type": "value"},
+        candidates=candidates,
+        flow=None,
+        db_session=None,
+        step_index=4,
+    )
+
+    assert decision.action_id is None
+    assert decision.done is True
+    assert decision.notes == "fallback_type_invalid_target"
+
+
 def test_type_action_rejects_non_form_target():
     candidates = [
         CandidateAction(
@@ -311,14 +337,17 @@ def test_type_action_rejects_non_form_target():
         task.start_url,
         "",
         candidates,
+        type_ids=[c.id for c in candidates if c.is_form_field or c.action_type == "type"],
         session=session,
         flow=flow,
         step_index=1,
     )
 
-    assert decision.action_id is None
-    assert decision.done is True
+    assert decision.action_id == "btn_0"
+    assert decision.done is False
+    assert decision.action_type == "click"
     assert decision.text_to_type is None
+    assert decision.notes == "Fallback click after invalid type target"
     assert any("policy_invalid_type_target" in log.message for log in session.logs)
 
 

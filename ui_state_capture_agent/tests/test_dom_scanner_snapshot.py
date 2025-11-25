@@ -1,5 +1,6 @@
 from src.agent.dom_scanner import (
     _prepare_goal_tokens,
+    _goal_contains_concrete_name,
     _scan_click_candidates_from_snapshot,
     _scan_text_candidates_from_snapshot,
 )
@@ -16,10 +17,13 @@ def test_snapshot_helpers_produce_candidates():
         AXNode(node_id="2", role="textbox", name="Name", dom_node_indices=[1]),
     ]
     snapshot = PageSnapshot(dom_nodes=dom_nodes, ax_nodes=ax_nodes)
-    goal_tokens = _prepare_goal_tokens("submit the name")
+    goal = "submit the name"
+    goal_tokens = _prepare_goal_tokens(goal)
 
     click_candidates = _scan_click_candidates_from_snapshot(snapshot, goal_tokens)
-    text_candidates = _scan_text_candidates_from_snapshot(snapshot, goal_tokens)
+    text_candidates = _scan_text_candidates_from_snapshot(
+        snapshot, goal_tokens, _goal_contains_concrete_name(goal)
+    )
 
     assert any(c.action_type == "click" for c in click_candidates)
     assert any(c.action_type == "type" for c in text_candidates)

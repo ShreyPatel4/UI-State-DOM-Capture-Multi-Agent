@@ -177,7 +177,11 @@ class BrowserSession:
                     )
                 )
         except Exception as exc:  # pragma: no cover - defensive parsing
-            logging.warning("cdp_snapshot_parse_failed reason=%s", exc)
+            reason = exc.args[0] if getattr(exc, "args", None) else exc
+            if reason == 0 or str(reason) == "0":
+                logging.debug("cdp_snapshot_parse_failed reason=%s", exc)
+            else:
+                logging.warning("cdp_snapshot_parse_failed reason=%s", exc)
             return None
 
         return PageSnapshot.from_nodes(dom_nodes, ax_nodes)
