@@ -137,7 +137,7 @@ async def run_agent_loop(
             page, max_actions=40, goal=task.goal, snapshot=snapshot, step_index=0
         )
         candidates = [c for c in candidates if _candidate_key(c) not in banned_actions]
-        type_ids = [c.id for c in candidates if c.is_form_field or c.action_type == "type"]
+        type_ids = [c.id for c in candidates if c.is_type_target]
         active_snapshot = snapshot
         if not candidates:
             flow.status = "no_actions"
@@ -183,7 +183,7 @@ async def run_agent_loop(
                     step_index=step_index,
                 )
                 candidates = [c for c in candidates if _candidate_key(c) not in banned_actions]
-                type_ids = [c.id for c in candidates if c.is_form_field or c.action_type == "type"]
+                type_ids = [c.id for c in candidates if c.is_type_target]
 
             if not candidates:
                 capture_manager.finish_flow(flow, status="no_actions")
@@ -224,6 +224,7 @@ async def run_agent_loop(
                     f"id={cand.id} text=\"{text_preview}\" score={cand.goal_match_score:.2f}"
                 )
             type_summary_text = "; ".join(type_summaries)
+            type_top_display = type_summary_text if type_ids else ""
             if active_snapshot:
                 log_flow_event(
                     session,
@@ -244,7 +245,7 @@ async def run_agent_loop(
                     url=current_url,
                     count=len(candidates),
                     types=type_ids[:5],
-                    type_summary=type_summary_text,
+                    type_summary=type_top_display,
                     summary=summary_text,
                 ),
             )

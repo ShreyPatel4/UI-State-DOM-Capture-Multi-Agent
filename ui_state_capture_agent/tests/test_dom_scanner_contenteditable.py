@@ -1,6 +1,10 @@
 from src.agent.dom_scanner import scan_candidate_actions
-from src.agent.page_snapshot import AXNode, PageSnapshot, SnapshotNode
 import asyncio
+import logging
+
+import pytest
+
+from src.agent.page_snapshot import AXNode, PageSnapshot, SnapshotNode
 
 
 class FakeLocator:
@@ -15,11 +19,11 @@ class FakeLocator:
 
 
 class FakeHandle:
-    def __init__(self, tag_name: str, attributes: dict[str, str], inner_text: str = ""):
+    def __init__(self, tag_name: str, attributes: dict[str, str], inner_text: str = "", uid: str = "uid-123"):
         self.tag_name = tag_name
         self.attributes = attributes
         self.inner_text_value = inner_text
-        self.uid = "uid-123"
+        self.uid = uid
 
     async def is_visible(self):
         return True
@@ -59,6 +63,17 @@ class FakeLocatorWithHandle:
         return await self.handle.is_visible()
 
 
+class FakeLocatorMultiple:
+    def __init__(self, handles: list[FakeHandle]):
+        self.handles = handles
+
+    async def count(self):
+        return len(self.handles)
+
+    def nth(self, index):
+        return self.handles[index]
+
+
 class FakePage:
     viewport_size = {"width": 0, "height": 0}
 
@@ -70,15 +85,17 @@ class FakePage:
 
 
 class FakePageLive(FakePage):
-    def __init__(self, handle: FakeHandle):
+    def __init__(self, handles: list[FakeHandle]):
         super().__init__()
-        self.handle = handle
+        self.handles = handles
 
     def locator(self, selector):
         if selector.startswith("label["):
             return FakeLocator()
-        if selector == "input, textarea, [contenteditable='true'], [role='textbox']":
-            return FakeLocatorWithHandle(self.handle)
+        if selector == "input, textarea, [contenteditable], [role='textbox']":
+            if len(self.handles) == 1:
+                return FakeLocatorWithHandle(self.handles[0])
+            return FakeLocatorMultiple(self.handles)
         return FakeLocator()
 
 
@@ -114,7 +131,7 @@ def test_live_page_contenteditable_type_candidates():
         attributes={"contenteditable": "true", "aria-label": "Issue title"},
         inner_text="",
     )
-    page = FakePageLive(handle)
+    page = FakePageLive([handle])
 
     candidates, type_ids = asyncio.run(
         scan_candidate_actions(
@@ -128,3 +145,36 @@ def test_live_page_contenteditable_type_candidates():
     assert type_candidates, "expected live scan to find a type candidate"
     assert any(c.id in type_ids for c in type_candidates), "type_ids should include live candidates"
     assert any("title" in (c.visible_text or c.description or "").lower() for c in type_candidates)
+
+
+def test_live_page_multiple_inputs_sets_type_ids_and_logs(caplog):
+    caplog.set_level(logging.DEBUG)
+
+    contenteditable_handle = FakeHandle(
+        tag_name="div",
+        attributes={"contenteditable": "plaintext-only", "role": "textbox", "aria-label": "Issue title"},
+        inner_text="",
+        uid="uid-content",
+    )
+    text_input_handle = FakeHandle(
+        tag_name="input",
+        attributes={"type": "text", "aria-label": "Issue description"},
+        inner_text="",
+        uid="uid-input",
+    )
+    page = FakePageLive([contenteditable_handle, text_input_handle])
+
+    candidates, type_ids = asyncio.run(
+        scan_candidate_actions(
+            page=page,
+            snapshot=None,
+            goal="Create issue",
+        )
+    )
+
+    type_candidates = [c for c in candidates if getattr(c, "is_type_target", False)]
+    assert type_candidates, "expected live scan to find multiple type candidates"
+    assert any(c.id in type_ids for c in type_candidates)
+
+    log_messages = [record.message for record in caplog.records if "live_type_targets" in record.message]
+    assert any("count=2" in message or "count=1" in message for message in log_messages)

@@ -136,7 +136,8 @@ def _is_dom_text_input(node: SnapshotNode) -> bool:
     node_name = (node.node_name or "").lower()
     if node_name in {"input", "textarea"}:
         return True
-    if node.attributes.get("contenteditable", "").lower() == "true":
+    contenteditable_attr = node.attributes.get("contenteditable")
+    if contenteditable_attr is not None and contenteditable_attr.lower() != "false":
         return True
     if node.attributes.get("role", "").lower() == "textbox":
         return True
@@ -222,14 +223,20 @@ async def scan_candidate_actions(
     """
     candidates: List[CandidateAction] = []
     candidate_ids: Set[str] = set()
+    candidate_by_id: dict[str, CandidateAction] = {}
     goal_tokens: Set[str] = _prepare_goal_tokens(goal)
     goal_has_concrete_name = _goal_contains_concrete_name(goal)
 
     def add_candidate(cand: CandidateAction) -> None:
-        if cand.id in candidate_ids or len(candidates) >= max_actions:
+        existing = candidate_by_id.get(cand.id)
+        if existing:
+            existing.is_type_target = existing.is_type_target or cand.is_type_target
+            return
+        if len(candidates) >= max_actions:
             return
         candidates.append(cand)
         candidate_ids.add(cand.id)
+        candidate_by_id[cand.id] = cand
 
     viewport_width = 0.0
     viewport_height = 0.0
@@ -485,7 +492,7 @@ async def scan_candidate_actions(
     click_count = await clickable_locator.count()
     for i in range(click_count):
         if len(candidates) >= max_actions:
-            return candidates, [c.id for c in candidates if c.is_form_field or c.action_type == "type"]
+            return candidates, [c.id for c in candidates if c.is_type_target]
         handle = clickable_locator.nth(i)
         if not await is_visible(handle):
             continue
@@ -556,7 +563,7 @@ async def scan_candidate_actions(
             )
         )
 
-    type_selector = "input, textarea, [contenteditable='true'], [role='textbox']"
+    type_selector = "input, textarea, [contenteditable], [role='textbox']"
     allowed_input_types = {"text", "search", "email", "url", "number", "password"}
 
     async def make_type_candidate_from_locator(handle, nth_index: int, type_index: int) -> tuple[Optional[str], Optional[CandidateAction]]:
@@ -569,7 +576,7 @@ async def scan_candidate_actions(
             if input_type not in allowed_input_types:
                 return None, None
 
-        if tag_name not in {"input", "textarea"} and not contenteditable_attr and (role or "").lower() != "textbox":
+        if tag_name not in {"input", "textarea"} and contenteditable_attr is None and (role or "").lower() != "textbox":
             return None, None
 
         aria_label_raw = trim_text(await handle.get_attribute("aria-label"), limit=120)
@@ -703,6 +710,23 @@ async def scan_candidate_actions(
         add_candidate(cand)
 
     await augment_with_type_candidates_from_playwright(next_type_index())
+
+    live_type_candidates = [
+        c for c in candidates if c.is_type_target and c.source_hint == "playwright_scan"
+    ]
+    sample_entries = [
+        {
+            "id": cand.id,
+            "kind": cand.kind,
+            "text": (cand.visible_text or cand.description or "")[:80],
+        }
+        for cand in live_type_candidates[:5]
+    ]
+    logging.debug(
+        "live_type_targets count=%s sample=%s",
+        len(live_type_candidates),
+        sample_entries,
+    )
 
     type_ids = [c.id for c in candidates if c.is_type_target]
     return candidates, type_ids
