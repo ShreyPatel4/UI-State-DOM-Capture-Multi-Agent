@@ -111,6 +111,13 @@ Decision rules for forms:
 - Once you have typed the requested name or title into the correct field, do not type into that same field again unless you clearly need to correct it.
 - After the key name or title field is filled, your next step should usually be a primary call to action that completes the task (for example "Create project", "Create issue", "Save", "Done", "Submit", "Update") rather than typing the same text into additional fields.
 
+Special handling for share or invite goals:
+- If the goal mentions words like "share", "invite", "add people", "add user", "send access", or includes an email address:
+  - First, open any obvious share or invite controls such as buttons or menu items whose text or semantics include "Share", "Invite", "Add people", "Add user", "Permissions", or "Private".
+  - After share or invite controls are open, look for text fields whose semantics include "invite_field" or "share_email_field", or whose label or placeholder contains words like "email", "invite", or "add people". Select that candidate with action_type "type" and set text_to_type to the email address from the goal.
+  - After typing the email, prefer clicking buttons with text containing "Invite", "Send", "Share", or "Add" that look like confirmation actions for the invite, instead of toggling the same Share or Private button again.
+  - Once the invite has been sent or the share has clearly been applied and the UI shows a success state, you should treat the goal as satisfied, set action_id to null, done to true, and avoid re opening the share or invite flow in the same run.
+
 Choosing buttons and call to action elements:
 - If there is a primary call to action button (is_primary_cta is true or semantics contain "primary" or "cta") whose visible text includes verbs such as create, new, add, save, submit, done, finish, or update, and the goal is about creating, adding, saving, finishing, or updating something, then once key text fields are filled you should strongly prefer clicking that button.
 - Do not keep clicking the same primary CTA if recent_events show effect_kind "no_change" or outcome "no_progress". In that case look for missing required fields, confirmation controls, or a way to close a modal after success.

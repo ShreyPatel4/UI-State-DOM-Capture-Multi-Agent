@@ -75,6 +75,23 @@ def _has_text_field_keyword(text: str) -> bool:
     return any(keyword in lowered for keyword in ["title", "name", "subject", "summary", "heading"])
 
 
+def _looks_like_invite_field(text: str) -> bool:
+    if not text:
+        return False
+    lowered = text.lower()
+    phrases = [
+        "email",
+        "mail",
+        "invite",
+        "add people",
+        "add person",
+        "people",
+        "name or email",
+        "search or invite",
+    ]
+    return any(phrase in lowered for phrase in phrases)
+
+
 def _compute_goal_score(candidate_text: str, goal_tokens: Set[str]) -> float:
     if not goal_tokens:
         return 0.0
@@ -164,6 +181,9 @@ def _scan_text_candidates_from_snapshot(
         goal_match_score = _compute_goal_score(visible_text, goal_tokens)
         if goal_has_concrete_name and _has_text_field_keyword(label):
             goal_match_score += 1.0
+        semantics = {"ax"}
+        if _looks_like_invite_field(label):
+            semantics.update({"invite_field", "share_email_field"})
         candidates.append(
             CandidateAction(
                 id=f"ax_input_{i}",
@@ -176,7 +196,7 @@ def _scan_text_candidates_from_snapshot(
                 is_form_field=True,
                 is_type_target=True,
                 goal_match_score=goal_match_score,
-                semantics={"ax"},
+                semantics=semantics,
                 aria_label=ax.name,
                 source_hint="ax_snapshot",
             )
@@ -190,6 +210,9 @@ def _scan_text_candidates_from_snapshot(
         goal_match_score = _compute_goal_score(label or node.node_name, goal_tokens)
         if goal_has_concrete_name and _has_text_field_keyword(label):
             goal_match_score += 1.0
+        semantics = {"dom_snapshot"}
+        if _looks_like_invite_field(label):
+            semantics.update({"invite_field", "share_email_field"})
         candidates.append(
             CandidateAction(
                 id=f"dom_input_{j}",
@@ -202,7 +225,7 @@ def _scan_text_candidates_from_snapshot(
                 is_form_field=True,
                 is_type_target=True,
                 goal_match_score=goal_match_score,
-                semantics={"dom_snapshot"},
+                semantics=semantics,
                 source_hint="dom_snapshot",
             )
         )
@@ -639,6 +662,7 @@ async def scan_candidate_actions(
                 label_text = trim_text(await label_locator.first.inner_text()) or ""
 
         labelledby_text = await resolve_labelledby_text(context, handle)
+        invite_hint = " ".join(filter(None, [label_text, placeholder_value, aria_label_raw, labelledby_text]))
         aria_label = aria_label_raw or labelledby_text
 
         text_content = trim_text(await handle.inner_text(), limit=120) or ""
@@ -672,6 +696,8 @@ async def scan_candidate_actions(
             text=text_content,
             input_type=input_type,
         )
+        if _looks_like_invite_field(invite_hint):
+            semantics.update({"invite_field", "share_email_field"})
 
         class_name = section_chain[0].get("className", "") if section_chain else ""
         is_primary_cta, is_nav_link, is_form_field = compute_flags(
@@ -856,6 +882,8 @@ async def scan_candidate_actions(
                     text=text,
                     input_type=None,
                 )
+                if _looks_like_invite_field(visible_text):
+                    semantics.update({"invite_field", "share_email_field"})
 
                 ancestor_text = ""
                 section_label = None
