@@ -22,7 +22,7 @@ class OpenAIChatPipeline:
             model=self.model,
             messages=[{"role": "user", "content": prompt}],
             temperature=0,
-            max_tokens=max_tokens,
+            max_completion_tokens=max_tokens,
         )
         return [{"generated_text": resp.choices[0].message.content}]
 
