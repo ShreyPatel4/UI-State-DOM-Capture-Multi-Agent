@@ -45,9 +45,20 @@ Rules:
 - action_id MUST be either one of the candidate ids from the list OR null.
 - Choose action_type "type" ONLY when the provided action_id is present in type_ids.
 - If action_type == "type", you MUST set text_to_type to a non empty string derived from the goal.
+- Base every decision strictly on the provided candidates and the user goal. Do not assume any app-specific behaviors.
+
+Decision rules for forms:
+
+1. If there is a primary call to action button (for example is_primary_cta is true or semantics contains "primary" or "cta") whose visible text contains a verb like "create", "new", "add", "save", "submit", "done", "finish" or "update", and the user goal is about creating, adding, saving or finishing something, you should strongly prefer clicking that button once the key text fields are filled.
+
+2. A key text field is one whose label or placeholder matches the goal, for example "Project name", "Title", "Issue title", "Page name" or similar. Once you have typed the requested name or title from the goal into such a field, you should NOT type into that same field again.
+
+3. After you have filled the most relevant name or title field, your next step should usually be a primary call to action such as "Create project", "Create issue", "Save", or similar that completes the task, rather than typing the same text into more and more fields.
+
+4. Avoid repeating the same type action that does not produce a new effect. If the last action already set the correct text and you see the same state again, choose a different action, usually a primary call to action that moves the flow forward.
+
 - If done == true, action_id MUST be null.
 - If action_id is null and done == false, that means "no suitable action" and the controller will stop.
-- Base every decision strictly on the provided candidates and the user goal. Do not assume any app-specific behaviors.
 
 When deciding between click and type actions:
 - If the goal mentions creating, naming, or titling something (for example "create issue named X" or "new project titled Y") and there is a candidate that is a text input or form field whose label or nearby text suggests it captures that name/title, you should select that candidate with action_type="type" and set text_to_type to the relevant text from the goal.

@@ -39,6 +39,71 @@ def _candidate_key(cand: CandidateAction) -> str:
     return f"{cand.action_type}:{cand.locator}:{cand.description}"
 
 
+def maybe_promote_primary_cta(
+    *,
+    decision: PolicyDecision,
+    task: TaskSpec,
+    candidates: list[CandidateAction],
+    typed_goal_text: bool,
+) -> PolicyDecision:
+    if decision.action_type != "type":
+        return decision
+
+    goal = (task.goal or "").lower()
+    if not goal:
+        return decision
+
+    is_creation_goal = any(
+        word in goal for word in ["create", "new", "add", "open", "start", "save", "submit", "finish"]
+    )
+    if not is_creation_goal:
+        return decision
+
+    if not typed_goal_text:
+        return decision
+
+    verbs = ["create", "save", "submit", "done", "finish", "add", "update"]
+    primary_ctas: list[CandidateAction] = []
+    for cand in candidates:
+        if cand.action_type == "type" or (cand.kind or "").lower() == "type":
+            continue
+        if not cand.is_primary_cta:
+            continue
+        label = (cand.visible_text or cand.text or "").strip()
+        if not label:
+            continue
+        if not any(verb in label.lower() for verb in verbs):
+            continue
+        primary_ctas.append(cand)
+
+    if not primary_ctas:
+        return decision
+
+    primary_ctas.sort(key=lambda c: getattr(c, "goal_match_score", 0.0), reverse=True)
+    chosen = primary_ctas[0]
+
+    logging.info(
+        "Promoting primary CTA %s over type action %s for goal %s",
+        chosen.id,
+        decision.action_id,
+        task.goal,
+    )
+
+    return PolicyDecision(
+        action_id=chosen.id,
+        action_type="click",
+        text_to_type="",
+        capture=decision.capture,
+        done=False,
+        notes="Auto promoted primary create or save button after goal text was typed.",
+        capture_before=decision.capture_before,
+        capture_after=decision.capture_after,
+        label=decision.label,
+        reason=decision.reason,
+        should_capture=decision.should_capture,
+    )
+
+
 async def _maybe_capture_state(
     capture_manager: CaptureManager,
     page,
@@ -90,6 +155,7 @@ async def run_agent_loop(
     diff_threshold = settings.dom_diff_threshold
     max_action_failures = settings.max_action_failures
     goal_text = task.goal.lower()
+    typed_goal_text = False
 
     failure_counts: dict[str, int] = defaultdict(int)
     banned_actions: set[str] = set()
@@ -279,6 +345,13 @@ async def run_agent_loop(
                 step_index=step_index,
             )
 
+            decision = maybe_promote_primary_cta(
+                decision=decision,
+                task=task,
+                candidates=candidates,
+                typed_goal_text=typed_goal_text,
+            )
+
             if decision.action_id is None:
                 if decision.capture:
                     fallback_snapshot = await browser.capture_page_snapshot()
@@ -460,6 +533,13 @@ async def run_agent_loop(
                         failure_counts[_candidate_key(selected_candidate)] += 1
                         type_failed = True
                         continue
+
+                    if (
+                        not type_failed
+                        and decision.text_to_type
+                        and decision.text_to_type.lower() in (task.goal or "").lower()
+                    ):
+                        typed_goal_text = True
             except PlaywrightTimeoutError:
                 key = _candidate_key(selected_candidate)
                 failure_counts[key] += 1
