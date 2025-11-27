@@ -247,27 +247,6 @@ async def scan_candidate_actions(
     Build a HAR-like catalogue of visible interactive elements, identifying both
     click targets and text entry fields using only generic DOM attributes.
     """
-    candidates: List[CandidateAction] = []
-    candidate_ids: Set[str] = set()
-    candidate_by_id: dict[str, CandidateAction] = {}
-
-    # Allow the scan to collect more than max_actions, then prune later.
-    # This avoids starving type targets when pages have lots of buttons.
-    soft_limit = max_actions * 2
-    goal_tokens: Set[str] = _prepare_goal_tokens(goal)
-    goal_has_concrete_name = _goal_contains_concrete_name(goal)
-
-    def add_candidate(cand: CandidateAction) -> None:
-        existing = candidate_by_id.get(cand.id)
-        if existing:
-            existing.is_type_target = existing.is_type_target or cand.is_type_target
-            return
-        if len(candidates) >= soft_limit:
-            return
-        candidates.append(cand)
-        candidate_ids.add(cand.id)
-        candidate_by_id[cand.id] = cand
-
     viewport_width = 0.0
     viewport_height = 0.0
     viewport = page.viewport_size
@@ -283,6 +262,9 @@ async def scan_candidate_actions(
             viewport_height = float(metrics.get("height", 0.0) or 0.0)
         except Exception:
             viewport_width = viewport_height = 0.0
+
+    goal_tokens: Set[str] = _prepare_goal_tokens(goal)
+    goal_has_concrete_name = _goal_contains_concrete_name(goal)
 
     async def is_visible(handle) -> bool:
         try:
@@ -515,98 +497,208 @@ async def scan_candidate_actions(
     def compute_goal_score(candidate_text: str) -> float:
         return _compute_goal_score(candidate_text, goal_tokens)
 
-    snapshot_click_candidates: List[CandidateAction] = []
-    snapshot_text_candidates: List[CandidateAction] = []
-    if snapshot:
-        snapshot_click_candidates = _scan_click_candidates_from_snapshot(snapshot, goal_tokens)
-        snapshot_text_candidates = _scan_text_candidates_from_snapshot(
-            snapshot, goal_tokens, goal_has_concrete_name
-        )
-        if snapshot_text_candidates:
-            examples = [
-                {
-                    "id": cand.id,
-                    "role": cand.role,
-                    "visible_text": (cand.visible_text or "")[:60],
+    overlay_keyword_tokens = [
+        "share",
+        "invite",
+        "publish",
+        "filter",
+        "sort",
+        "assignee",
+        "priority",
+        "link",
+        "save",
+    ]
+
+    async def find_overlay_roots() -> list:
+        try:
+            overlay_infos = await page.evaluate(
+                """
+                (viewportWidth, viewportHeight) => {
+                    function getXPath(node) {
+                        if (!node || node.nodeType !== Node.ELEMENT_NODE) return "";
+                        if (!node.parentElement) {
+                            return '/' + (node.tagName || '').toLowerCase();
+                        }
+                        const parent = node.parentElement;
+                        const siblings = Array.from(parent.children).filter((c) => c.tagName === node.tagName);
+                        const index = siblings.indexOf(node) + 1;
+                        const tag = (node.tagName || '').toLowerCase();
+                        return getXPath(parent) + '/' + tag + '[' + index + ']';
+                    }
+
+                    const sizeThresholdWidth = viewportWidth ? viewportWidth * 0.4 : 0;
+                    const sizeThresholdHeight = viewportHeight ? viewportHeight * 0.4 : 0;
+
+                    const overlayCandidates = [];
+                    const pushCandidate = (el, reason) => {
+                        if (!el || !el.getBoundingClientRect) return;
+                        const rect = el.getBoundingClientRect();
+                        if (!rect || !rect.width || !rect.height) return;
+                        const style = window.getComputedStyle(el);
+                        const zIndexValue = style.zIndex || "auto";
+                        if (zIndexValue === "auto") return;
+                        const z = parseFloat(zIndexValue);
+                        if (!Number.isFinite(z)) return;
+
+                        const largeEnough = rect.width >= sizeThresholdWidth || rect.height >= sizeThresholdHeight;
+                        if (!largeEnough && !reason) return;
+
+                        overlayCandidates.push({
+                            xpath: getXPath(el),
+                            z,
+                            role: el.getAttribute ? el.getAttribute("role") : null,
+                            ariaModal: el.getAttribute ? el.getAttribute("aria-modal") : null,
+                            reason: reason || "z-index",
+                        });
+                    };
+
+                    const explicitSelector = '[role="dialog"], [role="menu"], [aria-modal="true"], [data-portal], [data-overlay]';
+                    document.querySelectorAll(explicitSelector).forEach((el) => pushCandidate(el, "explicit"));
+
+                    document.querySelectorAll("*").forEach((el) => {
+                        const rect = el.getBoundingClientRect();
+                        if (!rect || !rect.width || !rect.height) return;
+                        if (rect.width < sizeThresholdWidth && rect.height < sizeThresholdHeight) return;
+                        const style = window.getComputedStyle(el);
+                        const zIndexValue = style.zIndex || "auto";
+                        if (zIndexValue === "auto") return;
+                        const z = parseFloat(zIndexValue);
+                        if (!Number.isFinite(z)) return;
+                        overlayCandidates.push({
+                            xpath: getXPath(el),
+                            z,
+                            role: el.getAttribute ? el.getAttribute("role") : null,
+                            ariaModal: el.getAttribute ? el.getAttribute("aria-modal") : null,
+                            reason: "size",
+                        });
+                    });
+
+                    const unique = new Map();
+                    overlayCandidates.forEach((entry) => {
+                        if (!entry.xpath) return;
+                        const existing = unique.get(entry.xpath);
+                        if (!existing || existing.z < entry.z) {
+                            unique.set(entry.xpath, entry);
+                        }
+                    });
+
+                    return Array.from(unique.values()).sort((a, b) => b.z - a.z).slice(0, 4);
                 }
-                for cand in snapshot_text_candidates[:3]
-            ]
-            logging.debug(
-                "text_candidates_from_snapshot step=%s count=%s examples=%s",
-                step_index,
-                len(snapshot_text_candidates),
-                examples,
+                """,
+                viewport_width,
+                viewport_height,
             )
-        for cand in snapshot_click_candidates:
-            add_candidate(cand)
+        except Exception:
+            return []
 
-    seen_elements: Set[str] = set()
+        overlay_roots = []
+        for entry in overlay_infos or []:
+            xpath = entry.get("xpath")
+            if not xpath:
+                continue
+            locator = page.locator(f"xpath={xpath}")
+            try:
+                if await locator.count() > 0:
+                    overlay_roots.append(locator.first)
+            except Exception:
+                continue
+        return overlay_roots
 
-    contexts: List[DomContext] = [page] + [frame for frame in page.frames if frame != page.main_frame]
+    def _augment_overlay_semantics(text: str, semantics: Set[str]) -> None:
+        lowered = text.lower()
+        for keyword in overlay_keyword_tokens:
+            if keyword in lowered:
+                semantics.add(keyword)
 
-    # Discover clickable elements.
-    clickable_selector = "button, a[href], [role='button'], [role='link'], [onclick], [tabindex]:not([tabindex='-1'])"
-    for context in contexts:
-        clickable_locator = context.locator(clickable_selector)
-        click_count = await clickable_locator.count()
-        for i in range(click_count):
-            if len(candidates) >= soft_limit:
-                break
-            handle = clickable_locator.nth(i)
-            if not await is_visible(handle):
+    async def collect_overlay_candidates(overlay_roots: list) -> tuple[list[CandidateAction], list[str]]:
+        overlay_candidates: list[CandidateAction] = []
+        overlay_type_ids: list[str] = []
+        overlay_seen: Set[str] = set()
+        clickable_selector = "button, a[href], [role='button'], [role='link'], [role='menuitem'], [onclick], [tabindex]:not([tabindex='-1'])"
+        type_selector = "input, textarea, [contenteditable], [role='textbox']"
+
+        async def add_overlay_candidate(candidate: CandidateAction, is_type: bool) -> None:
+            uid = candidate.id
+            if uid in overlay_seen:
+                return
+            overlay_candidates.append(candidate)
+            overlay_seen.add(uid)
+            if is_type:
+                overlay_type_ids.append(candidate.id)
+
+        for root_index, overlay_root in enumerate(overlay_roots):
+            try:
+                if not await is_visible(overlay_root):
+                    continue
+            except Exception:
                 continue
 
-            tag_name = (await handle.evaluate("(el) => el.tagName.toLowerCase()")) or ""
-            role_attr = (await handle.get_attribute("role")) or ""
-            contenteditable_attr = await handle.get_attribute("contenteditable")
+            role_attr = None
+            try:
+                role_attr = await overlay_root.get_attribute("role")
+            except Exception:
+                role_attr = None
 
-            if tag_name in {"input", "textarea"} or contenteditable_attr or role_attr.lower() == "textbox":
-                continue
+            overlay_label = role_attr or "overlay"
 
-            role = role_attr or None
-            aria_label_raw = trim_text(await handle.get_attribute("aria-label"), limit=120)
-            labelledby_text = await resolve_labelledby_text(context, handle)
-            aria_label = aria_label_raw or labelledby_text
-            placeholder = trim_text(await handle.get_attribute("placeholder"), limit=120)
-            inner_text = trim_text(await handle.inner_text(), limit=120)
-            visible_text = inner_text or aria_label or ""
-            ancestor_text = await collect_ancestor_text(handle)
-            section_chain = await collect_section_chain(handle)
-            bbox = await get_bounding_box(handle)
-            section_label = infer_section_label(section_chain, bbox)
-            label_text = trim_text(aria_label or visible_text, limit=120)
-            description = (
-                f"{tag_name or 'element'} \"{label_text}\"" if label_text else f"{tag_name or 'element'} index {i}"
-            )
-            semantics = compute_semantics(
-                tag=tag_name,
-                role=role,
-                label=label_text or "",
-                placeholder=placeholder or "",
-                text=inner_text or "",
-                input_type=None,
-            )
-            class_name = section_chain[0].get("className", "") if section_chain else ""
-            is_primary_cta, is_nav_link, is_form_field = compute_flags(
-                tag_name, role, class_name, section_label, False, semantics
-            )
-            goal_match_score = compute_goal_score(f"{visible_text} {ancestor_text}")
-            element_uid = await get_element_uid(handle)
-            if element_uid and element_uid in seen_elements:
-                continue
-            if element_uid:
-                seen_elements.add(element_uid)
+            clickable_locator = overlay_root.locator(clickable_selector)
+            click_count = 0
+            try:
+                click_count = await clickable_locator.count()
+            except Exception:
+                click_count = 0
 
-            xpath = await compute_xpath(handle, context)
+            for i in range(click_count):
+                handle = clickable_locator.nth(i)
+                if not await is_visible(handle):
+                    continue
 
-            add_candidate(
-                CandidateAction(
-                    id=f"btn_{i}" if tag_name != "a" else f"link_{i}",
-                    locator=f"{clickable_selector} >> nth={i}",
+                tag_name = (await handle.evaluate("(el) => el.tagName.toLowerCase()")) or ""
+                role_attr_val = (await handle.get_attribute("role")) or ""
+                if tag_name in {"input", "textarea"} or (role_attr_val or "").lower() == "textbox":
+                    continue
+
+                aria_label_raw = trim_text(await handle.get_attribute("aria-label"), limit=120)
+                labelledby_text = await resolve_labelledby_text(page, handle)
+                aria_label = aria_label_raw or labelledby_text
+                placeholder = trim_text(await handle.get_attribute("placeholder"), limit=120)
+                inner_text = trim_text(await handle.inner_text(), limit=160)
+                visible_text = inner_text or aria_label or ""
+                ancestor_text = await collect_ancestor_text(handle)
+                section_chain = await collect_section_chain(handle)
+                bbox = await get_bounding_box(handle)
+                section_label = infer_section_label(section_chain, bbox)
+                label_text = trim_text(aria_label or visible_text, limit=120)
+                description = (
+                    f"{tag_name or 'element'} \"{label_text}\"" if label_text else f"{tag_name or 'element'} overlay {i}"
+                )
+                semantics = compute_semantics(
+                    tag=tag_name,
+                    role=role_attr_val,
+                    label=label_text or "",
+                    placeholder=placeholder or "",
+                    text=inner_text or "",
+                    input_type=None,
+                )
+                semantics.update({"overlay"})
+                if role_attr:
+                    semantics.add(role_attr.lower())
+                _augment_overlay_semantics(visible_text, semantics)
+
+                class_name = section_chain[0].get("className", "") if section_chain else ""
+                is_primary_cta, is_nav_link, is_form_field = compute_flags(
+                    tag_name, role_attr_val, class_name, section_label, False, semantics
+                )
+                goal_match_score = compute_goal_score(f"{visible_text} {ancestor_text}")
+                xpath = await compute_xpath(handle, page)
+
+                candidate = CandidateAction(
+                    id=f"overlay_btn_{root_index}_{i}",
+                    locator=f"{clickable_selector}",
                     action_type="click",
                     description=description,
                     tag=tag_name,
-                    role=role,
+                    role=role_attr_val or overlay_label,
                     aria_label=aria_label,
                     type=None,
                     text=visible_text or inner_text,
@@ -622,296 +714,128 @@ async def scan_candidate_actions(
                     is_form_field=is_form_field,
                     goal_match_score=goal_match_score,
                     xpath=xpath,
+                    source_hint="overlay_scan",
                 )
-            )
 
-    type_selector = "input, textarea, [contenteditable], [role='textbox']"
-    async def make_type_candidate_from_locator(
-        context,
-        handle,
-        nth_index: int,
-        type_index: int,
-    ) -> tuple[Optional[str], Optional[CandidateAction]]:
-        tag_name = (await handle.evaluate("(el) => el.tagName.toLowerCase()")) or ""
-        contenteditable_attr = await handle.get_attribute("contenteditable")
-        role = (await handle.get_attribute("role")) or None
-        input_type = (await handle.get_attribute("type")) or None
+                add_overlay_candidate(candidate, False)
 
-        role_lower = (role or "").lower()
-        ce_lower = (contenteditable_attr or "").lower() if contenteditable_attr is not None else None
-
-        if tag_name == "input":
-            input_type = (input_type or "text").lower()
-            if input_type in {"file", "checkbox", "radio", "submit", "button", "reset", "image"}:
-                return None, None
-        elif tag_name == "textarea":
-            input_type = input_type or None
-        else:
-            is_contenteditable = contenteditable_attr is not None and ce_lower in {"", "true", "plaintext-only"}
-            if not is_contenteditable and role_lower != "textbox":
-                return None, None
-
-        aria_label_raw = trim_text(await handle.get_attribute("aria-label"), limit=120)
-        placeholder_value = trim_text(await handle.get_attribute("placeholder"), limit=120)
-        element_id = (await handle.get_attribute("id")) or ""
-
-        label_text = ""
-        if element_id:
-            label_locator = context.locator(f"label[for=\"{element_id}\"]")
-            if await label_locator.count() > 0:
-                label_text = trim_text(await label_locator.first.inner_text()) or ""
-
-        labelledby_text = await resolve_labelledby_text(context, handle)
-        invite_hint = " ".join(filter(None, [label_text, placeholder_value, aria_label_raw, labelledby_text]))
-        aria_label = aria_label_raw or labelledby_text
-
-        text_content = trim_text(await handle.inner_text(), limit=120) or ""
-        primary_hint = next(
-            (
-                hint
-                for hint in [label_text, aria_label, labelledby_text, placeholder_value, text_content, element_id]
-                if hint
-            ),
-            "",
-        )
-
-        ancestor_text = await collect_ancestor_text(handle)
-        section_chain = await collect_section_chain(handle)
-        bbox = await get_bounding_box(handle)
-        section_label = infer_section_label(section_chain, bbox)
-        visible_text = (
-            trim_text(aria_label_raw, limit=120)
-            or trim_text(label_text, limit=120)
-            or trim_text(placeholder_value, limit=120)
-            or trim_text(text_content, limit=120)
-            or trim_text(ancestor_text, limit=120)
-            or ""
-        )
-
-        semantics = compute_semantics(
-            tag=tag_name,
-            role=role,
-            label=primary_hint,
-            placeholder=placeholder_value or "",
-            text=text_content,
-            input_type=input_type,
-        )
-        if _looks_like_invite_field(invite_hint):
-            semantics.update({"invite_field", "share_email_field"})
-
-        class_name = section_chain[0].get("className", "") if section_chain else ""
-        is_primary_cta, is_nav_link, is_form_field = compute_flags(
-            tag_name, role, class_name, section_label, True, semantics
-        )
-        is_form_field = True
-        goal_match_score = compute_goal_score(f"{visible_text} {ancestor_text}")
-        if goal_has_concrete_name and _has_text_field_keyword(primary_hint or visible_text):
-            goal_match_score += 1.0
-
-        element_uid = await get_element_uid(handle)
-
-        if tag_name == "textarea":
-            base_desc = "multiline text area"
-        elif contenteditable_attr is not None:
-            base_desc = "editable text box"
-        elif tag_name == "input":
-            base_desc = f"text input ({input_type})" if input_type else "text input"
-        else:
-            base_desc = "text entry"
-
-        desc_hint = primary_hint or placeholder_value or text_content
-        description = f"{base_desc} \"{desc_hint}\"" if desc_hint else base_desc
-
-        xpath = await compute_xpath(handle, context)
-
-        candidate = CandidateAction(
-            id=f"input_{type_index}",
-            locator=f"{type_selector} >> nth={nth_index}",
-            action_type="type",
-            description=description,
-            tag=tag_name,
-            role=role,
-            aria_label=aria_label,
-            type=input_type,
-            text=primary_hint or text_content,
-            semantics=semantics,
-            bounding_box=bbox,
-            kind="type",
-            visible_text=visible_text,
-            placeholder=placeholder_value,
-            ancestor_text=ancestor_text,
-            section_label=section_label,
-            is_primary_cta=is_primary_cta,
-            is_nav_link=is_nav_link,
-            is_form_field=is_form_field,
-            is_type_target=True,
-            goal_match_score=goal_match_score,
-            source_hint="playwright_scan",
-            xpath=xpath,
-        )
-        return element_uid, candidate
-
-    def next_type_index() -> int:
-        max_index = -1
-        for cid in candidate_ids:
-            if cid.startswith("input_"):
-                try:
-                    max_index = max(max_index, int(cid.split("_", 1)[1]))
-                except ValueError:
-                    continue
-        return max_index + 1
-
-    async def augment_with_type_candidates_from_playwright(start_index: int) -> None:
-        # Scan type like fields in the main page and all child frames.
-        contexts = [page] + list(page.frames)
-        type_index = start_index
-
-        for ctx in contexts:
-            type_locator = ctx.locator(type_selector)
-            type_count = await type_locator.count()
+            type_locator = overlay_root.locator(type_selector)
+            type_count = 0
+            try:
+                type_count = await type_locator.count()
+            except Exception:
+                type_count = 0
 
             for i in range(type_count):
-                if len(candidates) >= soft_limit:
-                    return
-
                 handle = type_locator.nth(i)
                 if not await is_visible(handle):
                     continue
 
-                element_uid, candidate = await make_type_candidate_from_locator(
-                    ctx, handle, i, type_index
+                tag_name = (await handle.evaluate("(el) => el.tagName.toLowerCase()")) or ""
+                contenteditable_attr = await handle.get_attribute("contenteditable")
+                role_attr_val = (await handle.get_attribute("role")) or None
+                input_type = (await handle.get_attribute("type")) or None
+
+                role_lower = (role_attr_val or "").lower()
+                ce_lower = (contenteditable_attr or "").lower() if contenteditable_attr is not None else None
+
+                if tag_name == "input":
+                    input_type = (input_type or "text").lower()
+                    if input_type in {"file", "checkbox", "radio", "submit", "button", "reset", "image"}:
+                        continue
+                elif tag_name == "textarea":
+                    input_type = input_type or None
+                else:
+                    is_contenteditable = contenteditable_attr is not None and ce_lower in {"", "true", "plaintext-only"}
+                    if not is_contenteditable and role_lower != "textbox":
+                        continue
+
+                aria_label_raw = trim_text(await handle.get_attribute("aria-label"), limit=120)
+                placeholder_value = trim_text(await handle.get_attribute("placeholder"), limit=120)
+                element_id = (await handle.get_attribute("id")) or ""
+                label_text = ""
+                if element_id:
+                    label_locator = page.locator(f"label[for=\"{element_id}\"]")
+                    if await label_locator.count() > 0:
+                        label_text = trim_text(await label_locator.first.inner_text()) or ""
+
+                labelledby_text = await resolve_labelledby_text(page, handle)
+                aria_label = aria_label_raw or labelledby_text
+                text_content = trim_text(await handle.inner_text(), limit=160) or ""
+                primary_hint = next(
+                    (
+                        hint
+                        for hint in [label_text, aria_label, labelledby_text, placeholder_value, text_content, element_id]
+                        if hint
+                    ),
+                    "",
                 )
-                if not candidate:
-                    continue
 
-                if element_uid and element_uid in seen_elements:
-                    continue
-
-                add_candidate(candidate)
-                if element_uid:
-                    seen_elements.add(element_uid)
-
-                type_index += 1
-
-    async def augment_with_type_candidates_from_xpath(start_index: int) -> None:
-        type_index = start_index
-        for ctx_idx, context in enumerate(contexts):
-            try:
-                nodes = await context.evaluate(
-                    """
-                    () => {
-                        function getXPath(node) {
-                            if (node.nodeType !== Node.ELEMENT_NODE) return "";
-                            if (node.id) {
-                                return 'id("' + node.id + '")';
-                            }
-                            const parts = [];
-                            while (node && node.nodeType === Node.ELEMENT_NODE) {
-                                let index = 1;
-                                let sibling = node.previousSibling;
-                                while (sibling) {
-                                    if (sibling.nodeType === Node.ELEMENT_NODE &&
-                                        sibling.nodeName === node.nodeName) {
-                                        index += 1;
-                                    }
-                                    sibling = sibling.previousSibling;
-                                }
-                                const tagName = node.nodeName.toLowerCase();
-                                const part = index > 1 ? `${tagName}[${index}]` : tagName;
-                                parts.unshift(part);
-                                node = node.parentNode;
-                            }
-                            return "/" + parts.join("/");
-                        }
-
-                        const selector = 'input, textarea, [contenteditable], [role="textbox"]';
-                        const els = Array.from(document.querySelectorAll(selector));
-                        return els.map((el) => {
-                            const tag = el.tagName ? el.tagName.toLowerCase() : "";
-                            const placeholder = el.getAttribute("placeholder") || "";
-                            const aria = el.getAttribute("aria-label") || "";
-                            const text = (el.innerText || el.value || "").trim();
-                            return {
-                                xpath: getXPath(el),
-                                tag,
-                                placeholder,
-                                aria,
-                                text,
-                            };
-                        });
-                    }
-                    """
+                ancestor_text = await collect_ancestor_text(handle)
+                section_chain = await collect_section_chain(handle)
+                bbox = await get_bounding_box(handle)
+                section_label = infer_section_label(section_chain, bbox)
+                visible_text = (
+                    trim_text(aria_label_raw, limit=120)
+                    or trim_text(label_text, limit=120)
+                    or trim_text(placeholder_value, limit=120)
+                    or trim_text(text_content, limit=120)
+                    or trim_text(ancestor_text, limit=120)
+                    or ""
                 )
-            except Exception as exc:
-                logging.debug("xpath_type_scan: eval_failed step=%s ctx=%s error=%r", step_index, ctx_idx, exc)
-                continue
-
-            if not nodes:
-                logging.debug("xpath_type_scan: no_nodes step=%s ctx=%s", step_index, ctx_idx)
-                continue
-
-            logging.debug("xpath_type_scan: step=%s ctx=%s count=%s", step_index, ctx_idx, len(nodes))
-
-            for idx, node in enumerate(nodes):
-                if len(candidates) >= max_actions:
-                    logging.debug(
-                        "xpath_type_scan abort: max_actions reached step=%s len=%s",
-                        step_index,
-                        len(candidates),
-                    )
-                    return
-
-                xpath = node.get("xpath") or None
-                if not xpath:
-                    continue
-
-                if any(c.xpath == xpath for c in candidates if c.xpath):
-                    continue
-
-                tag = node.get("tag") or ""
-                placeholder = node.get("placeholder") or ""
-                aria = node.get("aria") or ""
-                text = node.get("text") or ""
-                visible_text = aria or placeholder or text
 
                 semantics = compute_semantics(
-                    tag=tag,
-                    role=None,
-                    label=visible_text,
-                    placeholder=placeholder,
-                    text=text,
-                    input_type=None,
+                    tag=tag_name,
+                    role=role_attr_val,
+                    label=primary_hint,
+                    placeholder=placeholder_value or "",
+                    text=text_content,
+                    input_type=input_type,
                 )
-                if _looks_like_invite_field(visible_text):
+                semantics.update({"overlay"})
+                if role_attr_val:
+                    semantics.add(role_attr_val.lower())
+                _augment_overlay_semantics(visible_text, semantics)
+                if _looks_like_invite_field(" ".join(filter(None, [label_text, placeholder_value, aria_label_raw, labelledby_text]))):
                     semantics.update({"invite_field", "share_email_field"})
 
-                ancestor_text = ""
-                section_label = None
-                is_primary_cta = False
-                is_nav_link = False
+                class_name = section_chain[0].get("className", "") if section_chain else ""
+                is_primary_cta, is_nav_link, is_form_field = compute_flags(
+                    tag_name, role_attr_val, class_name, section_label, True, semantics
+                )
                 is_form_field = True
-
-                goal_match_score = compute_goal_score(visible_text)
-                if goal_has_concrete_name and _has_text_field_keyword(visible_text):
+                goal_match_score = compute_goal_score(f"{visible_text} {ancestor_text}")
+                if goal_has_concrete_name and _has_text_field_keyword(primary_hint or visible_text):
                     goal_match_score += 1.0
 
-                description = f"xpath text entry \"{visible_text[:40]}\"" if visible_text else "xpath text entry"
+                base_desc = "text entry"
+                if tag_name == "textarea":
+                    base_desc = "multiline text area"
+                elif contenteditable_attr is not None:
+                    base_desc = "editable text box"
+                elif tag_name == "input":
+                    base_desc = f"text input ({input_type})" if input_type else "text input"
 
-                cand = CandidateAction(
-                    id=f"xpath_input_{type_index}",
-                    locator=f"xpath={xpath}",
+                desc_hint = primary_hint or placeholder_value or text_content
+                description = f"{base_desc} \"{desc_hint}\"" if desc_hint else base_desc
+
+                xpath = await compute_xpath(handle, page)
+
+                candidate = CandidateAction(
+                    id=f"overlay_input_{root_index}_{i}",
+                    locator=f"{type_selector}",
                     action_type="type",
                     description=description,
-                    tag=tag,
-                    role=None,
-                    aria_label=aria,
-                    type=None,
-                    text=visible_text,
+                    tag=tag_name,
+                    role=role_attr_val,
+                    aria_label=aria_label,
+                    type=input_type,
+                    text=primary_hint or text_content,
                     semantics=semantics,
-                    bounding_box=None,
+                    bounding_box=bbox,
                     kind="type",
                     visible_text=visible_text,
-                    placeholder=placeholder,
+                    placeholder=placeholder_value,
                     ancestor_text=ancestor_text,
                     section_label=section_label,
                     is_primary_cta=is_primary_cta,
@@ -919,81 +843,663 @@ async def scan_candidate_actions(
                     is_form_field=is_form_field,
                     is_type_target=True,
                     goal_match_score=goal_match_score,
-                    source_hint="xpath_scan",
                     xpath=xpath,
+                    source_hint="overlay_scan",
                 )
 
-                add_candidate(cand)
+                add_overlay_candidate(candidate, True)
+
+        return overlay_candidates, overlay_type_ids
+
+    async def add_active_element_candidates(
+        candidates: List[CandidateAction], type_ids: List[str]
+    ) -> None:
+        try:
+            active_handle = await page.evaluate_handle("() => document.activeElement || null")
+        except Exception:
+            return
+
+        try:
+            is_body = await active_handle.evaluate("(el) => !el || el === document.body")
+            if is_body:
+                return
+        except Exception:
+            return
+
+        existing_xpaths = {c.xpath for c in candidates if c.xpath}
+        existing_ids = {c.id for c in candidates}
+
+        async def build_candidate_from_handle(handle, as_type: bool, idx: int) -> Optional[CandidateAction]:
+            try:
+                tag_name = (await handle.evaluate("(el) => el.tagName.toLowerCase()")) or ""
+            except Exception:
+                return None
+            role_attr_val = (await handle.get_attribute("role")) or None
+            aria_label_raw = trim_text(await handle.get_attribute("aria-label"), limit=120)
+            placeholder = trim_text(await handle.get_attribute("placeholder"), limit=120)
+            inner_text = trim_text(await handle.inner_text(), limit=160)
+            visible_text = inner_text or aria_label_raw or ""
+            ancestor_text = await collect_ancestor_text(handle)
+            section_chain = await collect_section_chain(handle)
+            bbox = await get_bounding_box(handle)
+            section_label = infer_section_label(section_chain, bbox)
+            semantics = compute_semantics(
+                tag=tag_name,
+                role=role_attr_val,
+                label=visible_text,
+                placeholder=placeholder or "",
+                text=inner_text or "",
+                input_type=None,
+            )
+            semantics.add("focused")
+            goal_match_score = compute_goal_score(f"{visible_text} {ancestor_text}")
+            xpath = await compute_xpath(handle, page)
+            uid = await get_element_uid(handle)
+
+            cand_id = uid or (xpath or f"focused_{idx}")
+            prefix = "focused_input" if as_type else "focused_btn"
+            cand_id = f"{prefix}_{cand_id}"
+
+            candidate = CandidateAction(
+                id=cand_id,
+                locator="css=*",
+                action_type="type" if as_type else "click",
+                description=visible_text or tag_name or "focused element",
+                tag=tag_name,
+                role=role_attr_val,
+                aria_label=aria_label_raw,
+                type=None,
+                text=visible_text or inner_text,
+                semantics=semantics,
+                bounding_box=bbox,
+                kind="type" if as_type else "click",
+                visible_text=visible_text,
+                placeholder=placeholder,
+                ancestor_text=ancestor_text,
+                section_label=section_label,
+                is_primary_cta=False,
+                is_nav_link=False,
+                is_form_field=as_type,
+                is_type_target=as_type,
+                goal_match_score=goal_match_score,
+                xpath=xpath,
+                source_hint="focused_element",
+            )
+            return candidate
+
+        async def ensure_candidate(handle, as_type: bool, idx: int) -> None:
+            candidate = await build_candidate_from_handle(handle, as_type, idx)
+            if not candidate:
+                return
+            if candidate.id in existing_ids:
+                return
+            if candidate.xpath and candidate.xpath in existing_xpaths:
+                return
+            candidates.append(candidate)
+            existing_ids.add(candidate.id)
+            if candidate.is_type_target:
+                type_ids.append(candidate.id)
+
+        contenteditable_attr = await active_handle.get_attribute("contenteditable")
+        role_attr_val = (await active_handle.get_attribute("role")) or ""
+        tag_name = (await active_handle.evaluate("(el) => el.tagName.toLowerCase()")) or ""
+        input_type = (await active_handle.get_attribute("type")) or ""
+        ce_lower = (contenteditable_attr or "").lower() if contenteditable_attr is not None else None
+        role_lower = role_attr_val.lower()
+
+        is_textual = False
+        if tag_name in {"input", "textarea"}:
+            if tag_name == "input":
+                input_type = (input_type or "text").lower()
+                is_textual = input_type not in {"file", "checkbox", "radio", "submit", "button", "reset", "image"}
+            else:
+                is_textual = True
+        elif contenteditable_attr is not None and ce_lower in {"", "true", "plaintext-only"}:
+            is_textual = True
+        elif role_lower == "textbox":
+            is_textual = True
+
+        await ensure_candidate(active_handle, is_textual, 0)
+
+        try:
+            parent = await active_handle.evaluate_handle("(el) => el.parentElement")
+        except Exception:
+            parent = None
+        depth = 0
+        while parent and depth < 3:
+            try:
+                clickable = await parent.evaluate(
+                    "(el) => !!(el.tagName === 'BUTTON' || el.tagName === 'A' || el.getAttribute('role') === 'button' || el.getAttribute('role') === 'menuitem' || el.getAttribute('onclick') || (el.tabIndex !== undefined && el.tabIndex >= 0))"
+                )
+            except Exception:
+                clickable = False
+            if clickable:
+                await ensure_candidate(parent, False, depth + 1)
+            try:
+                parent = await parent.evaluate_handle("(el) => el.parentElement")
+            except Exception:
+                break
+            depth += 1
+
+    async def base_scan() -> tuple[List[CandidateAction], List[str]]:
+        candidates: List[CandidateAction] = []
+        candidate_ids: Set[str] = set()
+        candidate_by_id: dict[str, CandidateAction] = {}
+
+        # Allow the scan to collect more than max_actions, then prune later.
+        # This avoids starving type targets when pages have lots of buttons.
+        soft_limit = max_actions * 2
+
+        def add_candidate(cand: CandidateAction) -> None:
+            existing = candidate_by_id.get(cand.id)
+            if existing:
+                existing.is_type_target = existing.is_type_target or cand.is_type_target
+                return
+            if len(candidates) >= soft_limit:
+                return
+            candidates.append(cand)
+            candidate_ids.add(cand.id)
+            candidate_by_id[cand.id] = cand
+
+        snapshot_click_candidates: List[CandidateAction] = []
+        snapshot_text_candidates: List[CandidateAction] = []
+        if snapshot:
+            snapshot_click_candidates = _scan_click_candidates_from_snapshot(snapshot, goal_tokens)
+            snapshot_text_candidates = _scan_text_candidates_from_snapshot(
+                snapshot, goal_tokens, goal_has_concrete_name
+            )
+            if snapshot_text_candidates:
+                examples = [
+                    {
+                        "id": cand.id,
+                        "role": cand.role,
+                        "visible_text": (cand.visible_text or "")[:60],
+                    }
+                    for cand in snapshot_text_candidates[:3]
+                ]
                 logging.debug(
-                    "xpath_type_scan[%s:%s]: added_type_candidate id=%s xpath=%s desc=%s",
-                    ctx_idx,
-                    idx,
-                    cand.id,
-                    xpath,
-                    description,
+                    "text_candidates_from_snapshot step=%s count=%s examples=%s",
+                    step_index,
+                    len(snapshot_text_candidates),
+                    examples,
                 )
-                type_index += 1
+            for cand in snapshot_click_candidates:
+                add_candidate(cand)
 
+        seen_elements: Set[str] = set()
+
+        contexts: List[DomContext] = [page] + [frame for frame in page.frames if frame != page.main_frame]
+
+        # Discover clickable elements.
+        clickable_selector = "button, a[href], [role='button'], [role='link'], [onclick], [tabindex]:not([tabindex='-1'])"
+        for context in contexts:
+            clickable_locator = context.locator(clickable_selector)
+            click_count = await clickable_locator.count()
+            for i in range(click_count):
+                if len(candidates) >= soft_limit:
+                    break
+                handle = clickable_locator.nth(i)
+                if not await is_visible(handle):
+                    continue
+
+                tag_name = (await handle.evaluate("(el) => el.tagName.toLowerCase()")) or ""
+                role_attr = (await handle.get_attribute("role")) or ""
+                contenteditable_attr = await handle.get_attribute("contenteditable")
+
+                if tag_name in {"input", "textarea"} or contenteditable_attr or role_attr.lower() == "textbox":
+                    continue
+
+                role = role_attr or None
+                aria_label_raw = trim_text(await handle.get_attribute("aria-label"), limit=120)
+                labelledby_text = await resolve_labelledby_text(context, handle)
+                aria_label = aria_label_raw or labelledby_text
+                placeholder = trim_text(await handle.get_attribute("placeholder"), limit=120)
+                inner_text = trim_text(await handle.inner_text(), limit=120)
+                visible_text = inner_text or aria_label or ""
+                ancestor_text = await collect_ancestor_text(handle)
+                section_chain = await collect_section_chain(handle)
+                bbox = await get_bounding_box(handle)
+                section_label = infer_section_label(section_chain, bbox)
+                label_text = trim_text(aria_label or visible_text, limit=120)
+                description = (
+                    f"{tag_name or 'element'} \"{label_text}\"" if label_text else f"{tag_name or 'element'} index {i}"
+                )
+                semantics = compute_semantics(
+                    tag=tag_name,
+                    role=role,
+                    label=label_text or "",
+                    placeholder=placeholder or "",
+                    text=inner_text or "",
+                    input_type=None,
+                )
+                class_name = section_chain[0].get("className", "") if section_chain else ""
+                is_primary_cta, is_nav_link, is_form_field = compute_flags(
+                    tag_name, role, class_name, section_label, False, semantics
+                )
+                goal_match_score = compute_goal_score(f"{visible_text} {ancestor_text}")
+                element_uid = await get_element_uid(handle)
+                if element_uid and element_uid in seen_elements:
+                    continue
+                if element_uid:
+                    seen_elements.add(element_uid)
+
+                xpath = await compute_xpath(handle, context)
+
+                add_candidate(
+                    CandidateAction(
+                        id=f"btn_{i}" if tag_name != "a" else f"link_{i}",
+                        locator=f"{clickable_selector} >> nth={i}",
+                        action_type="click",
+                        description=description,
+                        tag=tag_name,
+                        role=role,
+                        aria_label=aria_label,
+                        type=None,
+                        text=visible_text or inner_text,
+                        semantics=semantics,
+                        bounding_box=bbox,
+                        kind="click",
+                        visible_text=visible_text,
+                        placeholder=placeholder,
+                        ancestor_text=ancestor_text,
+                        section_label=section_label,
+                        is_primary_cta=is_primary_cta,
+                        is_nav_link=is_nav_link,
+                        is_form_field=is_form_field,
+                        goal_match_score=goal_match_score,
+                        xpath=xpath,
+                    )
+                )
+
+        type_selector = "input, textarea, [contenteditable], [role='textbox']"
+
+        async def make_type_candidate_from_locator(
+            context,
+            handle,
+            nth_index: int,
+            type_index: int,
+        ) -> tuple[Optional[str], Optional[CandidateAction]]:
+            tag_name = (await handle.evaluate("(el) => el.tagName.toLowerCase()")) or ""
+            contenteditable_attr = await handle.get_attribute("contenteditable")
+            role = (await handle.get_attribute("role")) or None
+            input_type = (await handle.get_attribute("type")) or None
+
+            role_lower = (role or "").lower()
+            ce_lower = (contenteditable_attr or "").lower() if contenteditable_attr is not None else None
+
+            if tag_name == "input":
+                input_type = (input_type or "text").lower()
+                if input_type in {"file", "checkbox", "radio", "submit", "button", "reset", "image"}:
+                    return None, None
+            elif tag_name == "textarea":
+                input_type = input_type or None
+            else:
+                is_contenteditable = contenteditable_attr is not None and ce_lower in {"", "true", "plaintext-only"}
+                if not is_contenteditable and role_lower != "textbox":
+                    return None, None
+
+            aria_label_raw = trim_text(await handle.get_attribute("aria-label"), limit=120)
+            placeholder_value = trim_text(await handle.get_attribute("placeholder"), limit=120)
+            element_id = (await handle.get_attribute("id")) or ""
+
+            label_text = ""
+            if element_id:
+                label_locator = context.locator(f"label[for=\"{element_id}\"]")
+                if await label_locator.count() > 0:
+                    label_text = trim_text(await label_locator.first.inner_text()) or ""
+
+            labelledby_text = await resolve_labelledby_text(context, handle)
+            invite_hint = " ".join(filter(None, [label_text, placeholder_value, aria_label_raw, labelledby_text]))
+            aria_label = aria_label_raw or labelledby_text
+
+            text_content = trim_text(await handle.inner_text(), limit=120) or ""
+            primary_hint = next(
+                (
+                    hint
+                    for hint in [label_text, aria_label, labelledby_text, placeholder_value, text_content, element_id]
+                    if hint
+                ),
+                "",
+            )
+
+            ancestor_text = await collect_ancestor_text(handle)
+            section_chain = await collect_section_chain(handle)
+            bbox = await get_bounding_box(handle)
+            section_label = infer_section_label(section_chain, bbox)
+            visible_text = (
+                trim_text(aria_label_raw, limit=120)
+                or trim_text(label_text, limit=120)
+                or trim_text(placeholder_value, limit=120)
+                or trim_text(text_content, limit=120)
+                or trim_text(ancestor_text, limit=120)
+                or ""
+            )
+
+            semantics = compute_semantics(
+                tag=tag_name,
+                role=role,
+                label=primary_hint,
+                placeholder=placeholder_value or "",
+                text=text_content,
+                input_type=input_type,
+            )
+            if _looks_like_invite_field(invite_hint):
+                semantics.update({"invite_field", "share_email_field"})
+
+            class_name = section_chain[0].get("className", "") if section_chain else ""
+            is_primary_cta, is_nav_link, is_form_field = compute_flags(
+                tag_name, role, class_name, section_label, True, semantics
+            )
+            is_form_field = True
+            goal_match_score = compute_goal_score(f"{visible_text} {ancestor_text}")
+            if goal_has_concrete_name and _has_text_field_keyword(primary_hint or visible_text):
+                goal_match_score += 1.0
+
+            element_uid = await get_element_uid(handle)
+
+            if tag_name == "textarea":
+                base_desc = "multiline text area"
+            elif contenteditable_attr is not None:
+                base_desc = "editable text box"
+            elif tag_name == "input":
+                base_desc = f"text input ({input_type})" if input_type else "text input"
+            else:
+                base_desc = "text entry"
+
+            desc_hint = primary_hint or placeholder_value or text_content
+            description = f"{base_desc} \"{desc_hint}\"" if desc_hint else base_desc
+
+            xpath = await compute_xpath(handle, context)
+
+            candidate = CandidateAction(
+                id=f"input_{type_index}",
+                locator=f"{type_selector} >> nth={nth_index}",
+                action_type="type",
+                description=description,
+                tag=tag_name,
+                role=role,
+                aria_label=aria_label,
+                type=input_type,
+                text=primary_hint or text_content,
+                semantics=semantics,
+                bounding_box=bbox,
+                kind="type",
+                visible_text=visible_text,
+                placeholder=placeholder_value,
+                ancestor_text=ancestor_text,
+                section_label=section_label,
+                is_primary_cta=is_primary_cta,
+                is_nav_link=is_nav_link,
+                is_form_field=is_form_field,
+                is_type_target=True,
+                goal_match_score=goal_match_score,
+                source_hint="playwright_scan",
+                xpath=xpath,
+            )
+            return element_uid, candidate
+
+        def next_type_index() -> int:
+            max_index = -1
+            for cid in candidate_ids:
+                if cid.startswith("input_"):
+                    try:
+                        max_index = max(max_index, int(cid.split("_", 1)[1]))
+                    except ValueError:
+                        continue
+            return max_index + 1
+
+        async def augment_with_type_candidates_from_playwright(start_index: int) -> None:
+            # Scan type like fields in the main page and all child frames.
+            contexts = [page] + list(page.frames)
+            type_index = start_index
+
+            for ctx in contexts:
+                type_locator = ctx.locator(type_selector)
+                type_count = await type_locator.count()
+
+                for i in range(type_count):
+                    if len(candidates) >= soft_limit:
+                        return
+
+                    handle = type_locator.nth(i)
+                    if not await is_visible(handle):
+                        continue
+
+                    element_uid, candidate = await make_type_candidate_from_locator(
+                        ctx, handle, i, type_index
+                    )
+                    if not candidate:
+                        continue
+
+                    if element_uid and element_uid in seen_elements:
+                        continue
+
+                    add_candidate(candidate)
+                    if element_uid:
+                        seen_elements.add(element_uid)
+
+                    type_index += 1
+
+        async def augment_with_type_candidates_from_xpath(start_index: int) -> None:
+            type_index = start_index
+            for ctx_idx, context in enumerate(contexts):
+                try:
+                    nodes = await context.evaluate(
+                        """
+                        () => {
+                            function getXPath(node) {
+                                if (node.nodeType !== Node.ELEMENT_NODE) return "";
+                                if (node.id) {
+                                    return 'id("' + node.id + '")';
+                                }
+                                const parts = [];
+                                while (node && node.nodeType === Node.ELEMENT_NODE) {
+                                    let index = 1;
+                                    let sibling = node.previousSibling;
+                                    while (sibling) {
+                                        if (sibling.nodeType === Node.ELEMENT_NODE &&
+                                            sibling.nodeName === node.nodeName) {
+                                            index += 1;
+                                        }
+                                        sibling = sibling.previousSibling;
+                                    }
+                                    const tagName = node.nodeName.toLowerCase();
+                                    const part = index > 1 ? `${tagName}[${index}]` : tagName;
+                                    parts.unshift(part);
+                                    node = node.parentNode;
+                                }
+                                return "/" + parts.join("/");
+                            }
+
+                            const selector = 'input, textarea, [contenteditable], [role="textbox"]';
+                            const els = Array.from(document.querySelectorAll(selector));
+                            return els.map((el) => {
+                                const tag = el.tagName ? el.tagName.toLowerCase() : "";
+                                const placeholder = el.getAttribute("placeholder") || "";
+                                const aria = el.getAttribute("aria-label") || "";
+                                const text = (el.innerText || el.value || "").trim();
+                                return {
+                                    xpath: getXPath(el),
+                                    tag,
+                                    placeholder,
+                                    aria,
+                                    text,
+                                };
+                            });
+                        }
+                        """
+                    )
+                except Exception as exc:
+                    logging.debug("xpath_type_scan: eval_failed step=%s ctx=%s error=%r", step_index, ctx_idx, exc)
+                    continue
+
+                if not nodes:
+                    logging.debug("xpath_type_scan: no_nodes step=%s ctx=%s", step_index, ctx_idx)
+                    continue
+
+                logging.debug("xpath_type_scan: step=%s ctx=%s count=%s", step_index, ctx_idx, len(nodes))
+
+                for idx, node in enumerate(nodes):
+                    if len(candidates) >= max_actions:
+                        logging.debug(
+                            "xpath_type_scan abort: max_actions reached step=%s len=%s",
+                            step_index,
+                            len(candidates),
+                        )
+                        return
+
+                    xpath = node.get("xpath") or None
+                    if not xpath:
+                        continue
+
+                    if any(c.xpath == xpath for c in candidates if c.xpath):
+                        continue
+
+                    tag = node.get("tag") or ""
+                    placeholder = node.get("placeholder") or ""
+                    aria = node.get("aria") or ""
+                    text = node.get("text") or ""
+                    visible_text = aria or placeholder or text
+
+                    semantics = compute_semantics(
+                        tag=tag,
+                        role=None,
+                        label=visible_text,
+                        placeholder=placeholder,
+                        text=text,
+                        input_type=None,
+                    )
+                    if _looks_like_invite_field(visible_text):
+                        semantics.update({"invite_field", "share_email_field"})
+
+                    ancestor_text = ""
+                    section_label = None
+                    is_primary_cta = False
+                    is_nav_link = False
+                    is_form_field = True
+
+                    goal_match_score = compute_goal_score(visible_text)
+                    if goal_has_concrete_name and _has_text_field_keyword(visible_text):
+                        goal_match_score += 1.0
+
+                    description = f"xpath text entry \"{visible_text[:40]}\"" if visible_text else "xpath text entry"
+
+                    cand = CandidateAction(
+                        id=f"xpath_input_{type_index}",
+                        locator=f"xpath={xpath}",
+                        action_type="type",
+                        description=description,
+                        tag=tag,
+                        role=None,
+                        aria_label=aria,
+                        type=None,
+                        text=visible_text,
+                        semantics=semantics,
+                        bounding_box=None,
+                        kind="type",
+                        visible_text=visible_text,
+                        placeholder=placeholder,
+                        ancestor_text=ancestor_text,
+                        section_label=section_label,
+                        is_primary_cta=is_primary_cta,
+                        is_nav_link=is_nav_link,
+                        is_form_field=is_form_field,
+                        is_type_target=True,
+                        goal_match_score=goal_match_score,
+                        source_hint="xpath_scan",
+                        xpath=xpath,
+                    )
+
+                    add_candidate(cand)
+                    logging.debug(
+                        "xpath_type_scan[%s:%s]: added_type_candidate id=%s xpath=%s desc=%s",
+                        ctx_idx,
+                        idx,
+                        cand.id,
+                        xpath,
+                        description,
+                    )
+                    type_index += 1
+
+            logging.debug(
+                "xpath_type_scan done step=%s total_xpath_type_candidates=%s",
+                step_index,
+                len([c for c in candidates if c.is_type_target and c.source_hint == "xpath_scan"]),
+            )
+
+        for cand in snapshot_text_candidates:
+            add_candidate(cand)
+
+        await augment_with_type_candidates_from_playwright(next_type_index())
+        await augment_with_type_candidates_from_xpath(next_type_index())
+
+        live_type_candidates = [
+            c for c in candidates if c.is_type_target and c.source_hint == "playwright_scan"
+        ]
+        sample_entries = [
+            {
+                "id": cand.id,
+                "kind": cand.kind,
+                "text": (cand.visible_text or cand.description or "")[:80],
+            }
+            for cand in live_type_candidates[:5]
+        ]
         logging.debug(
-            "xpath_type_scan done step=%s total_xpath_type_candidates=%s",
-            step_index,
-            len([c for c in candidates if c.is_type_target and c.source_hint == "xpath_scan"]),
+            "live_type_targets count=%s sample=%s",
+            len(live_type_candidates),
+            sample_entries,
         )
 
-    for cand in snapshot_text_candidates:
-        add_candidate(cand)
+        # Hard cap total actions, but never starve type targets.
+        if len(candidates) > max_actions:
+            type_candidates = [c for c in candidates if c.is_type_target]
+            other_candidates = [c for c in candidates if not c.is_type_target]
 
-    await augment_with_type_candidates_from_playwright(next_type_index())
-    await augment_with_type_candidates_from_xpath(next_type_index())
+            # Keep at most half the budget for type fields, but at least one if any exist.
+            max_type_keep = min(len(type_candidates), max(1, max_actions // 2)) if type_candidates else 0
 
-    live_type_candidates = [
-        c for c in candidates if c.is_type_target and c.source_hint == "playwright_scan"
-    ]
-    sample_entries = [
-        {
-            "id": cand.id,
-            "kind": cand.kind,
-            "text": (cand.visible_text or cand.description or "")[:80],
-        }
-        for cand in live_type_candidates[:5]
-    ]
-    logging.debug(
-        "live_type_targets count=%s sample=%s",
-        len(live_type_candidates),
-        sample_entries,
-    )
+            # Prefer fields that look like title or name, then by goal match.
+            type_candidates_sorted = sorted(
+                type_candidates,
+                key=lambda c: (
+                    1 if "title_field" in (c.semantics or set()) else 0,
+                    c.goal_match_score,
+                ),
+                reverse=True,
+            )
+            kept_types = type_candidates_sorted[:max_type_keep]
 
-    # Hard cap total actions, but never starve type targets.
-    if len(candidates) > max_actions:
-        type_candidates = [c for c in candidates if c.is_type_target]
-        other_candidates = [c for c in candidates if not c.is_type_target]
+            remaining_slots = max_actions - len(kept_types)
+            other_candidates_sorted = sorted(
+                other_candidates,
+                key=lambda c: (
+                    1 if c.is_primary_cta else 0,
+                    c.goal_match_score,
+                ),
+                reverse=True,
+            )
+            kept_others = other_candidates_sorted[: max(0, remaining_slots)]
 
-        # Keep at most half the budget for type fields, but at least one if any exist.
-        max_type_keep = min(len(type_candidates), max(1, max_actions // 2)) if type_candidates else 0
+            candidates = kept_types + kept_others
 
-        # Prefer fields that look like title or name, then by goal match.
-        type_candidates_sorted = sorted(
-            type_candidates,
-            key=lambda c: (
-                1 if "title_field" in (c.semantics or set()) else 0,
-                c.goal_match_score,
-            ),
-            reverse=True,
-        )
-        kept_types = type_candidates_sorted[:max_type_keep]
+        type_ids = [c.id for c in candidates if c.is_type_target]
+        return candidates, type_ids
 
-        remaining_slots = max_actions - len(kept_types)
-        other_candidates_sorted = sorted(
-            other_candidates,
-            key=lambda c: (
-                1 if c.is_primary_cta else 0,
-                c.goal_match_score,
-            ),
-            reverse=True,
-        )
-        kept_others = other_candidates_sorted[: max(0, remaining_slots)]
+    overlay_roots = await find_overlay_roots()
+    if not overlay_roots:
+        base_candidates, base_type_ids = await base_scan()
+        await add_active_element_candidates(base_candidates, base_type_ids)
+        return base_candidates, base_type_ids
 
-        candidates = kept_types + kept_others
+    overlay_candidates, overlay_type_ids = await collect_overlay_candidates(overlay_roots)
+    base_candidates, base_type_ids = await base_scan()
 
-    type_ids = [c.id for c in candidates if c.is_type_target]
-    return candidates, type_ids
+    candidates = overlay_candidates + base_candidates
+    merged_type_ids = []
+    for cid in overlay_type_ids + base_type_ids:
+        if cid not in merged_type_ids:
+            merged_type_ids.append(cid)
+
+    await add_active_element_candidates(candidates, merged_type_ids)
+
+    return candidates, merged_type_ids

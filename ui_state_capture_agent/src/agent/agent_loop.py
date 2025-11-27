@@ -492,6 +492,7 @@ async def run_agent_loop(
                                 "step_index": step_index,
                                 "action_id": decision.action_id,
                                 "action_type": decision.action_type,
+                                "text_to_type": decision.text_to_type,
                                 "effect_kind": "timeout",
                                 "outcome": "timeout",
                                 "comment": "Action timed out",
@@ -548,6 +549,7 @@ async def run_agent_loop(
                                     "step_index": step_index,
                                     "action_id": decision.action_id,
                                     "action_type": decision.action_type,
+                                    "text_to_type": decision.text_to_type,
                                     "effect_kind": "timeout",
                                     "outcome": "timeout",
                                     "comment": "Action timed out",
@@ -591,6 +593,7 @@ async def run_agent_loop(
                         "step_index": step_index,
                         "action_id": decision.action_id,
                         "action_type": decision.action_type,
+                        "text_to_type": decision.text_to_type,
                         "effect_kind": "timeout",
                         "outcome": "timeout",
                         "comment": "Action timed out",
@@ -638,6 +641,29 @@ async def run_agent_loop(
                 or state_kind != "no_change"
                 or changed
             )
+
+            repeated_identical_type = False
+            if decision.action_type == "type" and recent_events:
+                last_event = recent_events[-1]
+                if (
+                    last_event.get("action_type") == "type"
+                    and last_event.get("action_id") == decision.action_id
+                ):
+                    last_text = (last_event.get("text_to_type") or "").strip()
+                    current_text = (decision.text_to_type or "").strip()
+                    if last_text == current_text:
+                        repeated_identical_type = True
+                        has_progress = False
+                        changed = False
+                        state_kind = "no_change"
+                        key = _candidate_key(selected_candidate)
+                        banned_actions.add(key)
+                        log_flow_event(
+                            session,
+                            flow,
+                            "warning",
+                            f"Banned {selected_candidate.id} for repeated identical type with no progress",
+                        )
 
             if not changed:
                 key = _candidate_key(selected_candidate)
@@ -695,6 +721,9 @@ async def run_agent_loop(
 
             effect_kind = captured_state_kind or state_kind or ("url_change" if url_changed else "no_change")
             dom_diff_score = diff_score
+            if repeated_identical_type:
+                effect_kind = "no_change"
+                dom_diff_score = 0.0
             if timed_out:
                 outcome = "timeout"
             elif dom_diff_score is None:
@@ -702,6 +731,9 @@ async def run_agent_loop(
             elif dom_diff_score > diff_threshold:
                 outcome = "progress"
             else:
+                outcome = "no_effect"
+
+            if repeated_identical_type:
                 outcome = "no_effect"
 
             if outcome == "progress":
@@ -718,6 +750,7 @@ async def run_agent_loop(
                     "step_index": step_index,
                     "action_id": decision.action_id,
                     "action_type": decision.action_type,
+                    "text_to_type": decision.text_to_type,
                     "effect_kind": effect_kind,
                     "outcome": outcome,
                     "comment": comment_string,

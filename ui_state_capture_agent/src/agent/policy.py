@@ -55,7 +55,7 @@ class PolicyInput:
         return payload
 
 
-POLICY_SYSTEM_PROMPT = """
+POLICY_SYSTEM_PROMPT = """ 
 You are the deterministic UI policy for Agent B. Choose exactly one next step that drives the live web app toward the user goal while capturing UI states.
 
 You receive:
@@ -84,6 +84,24 @@ Core rules:
 - If action_id is null and done is false, you are saying "no suitable action" and the controller will stop.
 - Base every decision strictly on the provided candidates, goal, banned_action_ids, and recent_events. Do not assume hidden app specific behavior.
 
+Cost awareness for type vs click:
+- Treat type actions as more expensive than click actions. Only type when there is no obvious clickable option that directly matches what the goal needs (for example a button or option whose text already contains the desired value like a name, email, status, or priority).
+- If you have already typed a value into a field and that value matches the goal, do not type the same text into that field again. Repeating an identical type into the same field is almost always wasted work.
+
+Drop down and combobox behavior:
+
+- When the goal asks to set or change a value such as assignee, priority, status, label, or similar, the usual pattern is:
+  1) Click a control whose text suggests a picker or combobox (for example "Assignee", "Set priority", "Status", "Label").
+  2) If a list of options is visible, prefer clicking the option whose text best matches the requested value from the goal (for example "Urgent", "High", a user email, or a project name), instead of typing into a related text field.
+  3) Only use type into a search field inside that picker when there are many options and no visible option text clearly matches the requested value.
+
+- After you have typed into a search field inside a picker or dropdown, your next step should be to click one of the filtered options that matches the goal, not to keep typing the same search text again.
+- If repeated type actions into the same picker field do not cause any visible progress (the same options stay visible and no new state appears), switch strategy and prefer click actions or a different control.
+
+- After you have typed into a search field inside a picker or dropdown, your next step should be to click one of the filtered options that matches the goal, not to keep typing the same search text again.
+- If repeated type actions into the same picker field do not cause any visible progress (the same options stay visible and no new state appears), switch strategy and prefer click actions or a different control.
+- if there is combo of drop down plus a list to select from, prefer to locate the cadidates by the aria lable and then select click action on list item rather than typing into drop down
+
 Use of banned_action_ids and recent_events:
 - Never select an action_id that is in banned_action_ids.
 - If recent_events show that you already tried an action and its effect_kind was "no_change" or outcome was "no_progress", avoid repeating that same action unless there is a clear new reason.
@@ -103,6 +121,11 @@ Completion logic and avoiding duplicate flows:
   - notes explaining that the item has been created or the change applied.
 - Once you have created the requested item or applied the requested change, do not start the same create flow again in this run. For example, do not click "Create new issue", "New page", or "Add page" a second time just because it is still visible.
 - If the UI shows clear success indicators containing the goal entity and words like "created" or "Issue created" or shows a new row or page whose title matches the goal, prefer to stop rather than create another one.
+
+Navigation and search:
+- If the goal is to open or go to a page, database, project, or issue with a specific name, first look for candidates whose text or semantics indicate a page or navigation item that contains key words from the goal (for example semantics including "nav_link" or "page_link"). Prefer clicking those over a generic Search button.
+- Only click generic Search buttons (candidates whose text or semantics indicate search) when there is no visible navigation item that matches the goal name.
+- After clicking a Search button, if a text field with semantics such as "search_field" appears, your next step should be a type action into that field using relevant text from the goal. Do not repeatedly click the same Search button when it does not reveal new fields or controls.
 
 Decision rules for forms:
 - A key text field is one whose label, placeholder, or nearby text clearly represents the main name or title in the goal, such as "Project name", "Issue title", "Title", or "Page title".
@@ -126,10 +149,6 @@ Choosing buttons and call to action elements:
   2) choosing options whose text matches values mentioned in the goal (for example the specified email or title),
   3) then clicking a single confirm or apply button.
 
-- For goals that mention "share", "invite", "add people", or specify an email address:
-  - After you have opened sharing controls (for example a Share / Private / Invite dialog), look for text fields whose label or placeholder includes words like "email", "name", "invite", or "people" and select them with action_type "type" to enter the requested email address.
-  - After typing the email, prefer clicking buttons with text like "Invite", "Send", "Share", or "Add" to complete the invite instead of re-opening the same Share / Private toggle.
-
 Avoiding useless repetition:
 - Avoid repeating the same type action when it will not change state. If the correct text is already present in that field, choose a different action that advances the flow, usually a primary CTA or another field that is still required.
 - When several candidates have similar text, use semantics, their kind, the goal text, and recent_events to choose the one that best progresses the task.
@@ -144,13 +163,7 @@ JSON output format requirements:
 - Booleans must be true or false in lowercase. Use null for text_to_type when action_type is not "type".
 - Do not add comments, trailing commas, or any extra text before or after the JSON object.
 - Never emit unquoted identifiers such as action_id: btn_5. That is invalid JSON and will cause the controller to stop.
-
-Summary of behavior:
-- Use candidates, banned_action_ids, and recent_events to open the right UI surfaces, type required names or filter values exactly once into the correct fields, click the correct primary or confirm buttons, avoid repeating ineffective actions, and recognize when the user goal is already satisfied.
-- When you believe the goal has been achieved, return:
-  { "action_id": null, "action_type": "click", "text_to_type": null, "capture": true, "done": true, "notes": "..." }.
 """
-
 def build_policy_prompt(
     task: TaskSpec,
     app_name: str,
