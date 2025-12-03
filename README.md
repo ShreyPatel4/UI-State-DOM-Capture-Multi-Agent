@@ -1,5 +1,5 @@
-# Softlight UI State Capture Agent
-End-to-end agent that runs browser tasks, tracks flows in Postgres, and stores screenshots/DOM snapshots in MinIO. Code lives under `ui_state_capture_agent/`.
+# DOM-UI State Capture Multi-Agent
+End-to-end agents that runs browser tasks, tracks flows in Postgres, and stores screenshots/DOM snapshots in MinIO. Code lives under `ui_state_capture_agent/`.
 
 ## Quick start
 - Requirements: Python 3.10+, Postgres, MinIO, Chromium via Playwright, optional GPU for HF policy models.
